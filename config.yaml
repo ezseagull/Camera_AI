@@ -1,0 +1,75 @@
+# All data/model paths except --source are relative to this configuration file.
+input:
+  fallback_fps: 30.0
+
+roi:
+  file: roi.json
+  # Example only: normalized x,y in the PROCESSED/UNDISTORTED image.
+  # Draw your own ROI with --edit-roi. If roi.json exists it overrides these points.
+  points: [[0.25, 0.08], [0.75, 0.08], [0.85, 0.92], [0.15, 0.92]]
+  context_margin_fraction: 0.12  # Padding in full-frame width/height for tracking.
+
+undistort:
+  mode: none  # none | pinhole | fisheye; enable only with genuine calibration.
+  calibration_file: camera_calibration.npz
+  alpha: 0.0  # Pinhole: 0 crops more black borders, 1 keeps more field of view.
+  balance: 0.0  # Fisheye equivalent; re-draw ROI after changing geometry.
+
+person:
+  model: yolo26s.pt
+  imgsz: 960
+  confidence: 0.10  # Keep <= track_low_thresh; low detections help recover tracks.
+  iou: 0.70
+  lost_seconds: 2.0  # Converted to frames using the video FPS; no frame skipping.
+  tracker:
+    track_high_thresh: 0.35
+    track_low_thresh: 0.10
+    new_track_thresh: 0.45
+    match_thresh: 0.80
+    fuse_score: true
+    gmc_method: none  # Fixed camera. Try sparseOptFlow if the camera actually moves.
+    with_reid: true
+    model: auto  # YOLO26 may fall back to yolo26n-cls.pt; appearance, not a person's name.
+    proximity_thresh: 0.35
+    appearance_thresh: 0.80
+
+face:
+  model_pack: buffalo_l  # SCRFD-10G detector; only the detection module is used.
+  onnx_path: null  # Optional licensed five-landmark SCRFD .onnx, replaces model_pack.
+  input_size: [640, 640]
+  confidence: 0.40
+  every_n_frames: 2
+  crop_padding: 0.12
+  person_crop_height_fraction: 1.0  # Full person by default for a high/oblique camera.
+  rotation_angles: [-30, 30]  # Optional roll search, NOT pitch correction.
+  rotation_every_n_frames: 6
+  rotate_only_if_empty: true
+  nms_iou: 0.40
+
+association:
+  person_padding: 0.08
+  min_face_coverage: 0.85
+  max_face_person_ratio: 0.90
+  expected_head_xy: [0.5, 0.25]  # Soft prior only, relative to the person bbox.
+  ambiguity_margin: 0.10  # Reject a face when two possible owners have similar cost.
+  max_cost: 0.70
+
+quality:
+  min_det_score: 0.55
+  min_face_px: 32  # Measured BEFORE alignment/upscaling; try >=64 for enrollment.
+  min_eye_distance_px: 8
+  min_sharpness: 12.0  # Laplacian variance on a 112x112 grayscale crop; tune per camera.
+  min_brightness: 25.0
+  max_brightness: 230.0
+
+gallery:
+  top_k: 5
+  min_track_observations: 3
+  min_sample_gap_s: 0.40  # Within this interval replace only if quality improves.
+  crop_padding: 0.18
+  save_aligned: true
+  aligned_size: 112
+
+output:
+  directory: outputs
+  save_video: true  # Annotated MP4 has no audio.

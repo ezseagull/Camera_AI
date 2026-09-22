@@ -1,0 +1,10 @@
+# Python 3.10-3.12 recommended. API versions checked on 2026-09-22.
+ultralytics==8.4.158
+insightface==2.0
+opencv-python>=4.11,<5
+numpy>=1.26,<3
+scipy>=1.11,<2
+PyYAML>=6,<7
+lap>=0.5.12,<1
+# InsightFace installs CPU ONNX Runtime. For NVIDIA, replace it AFTER installation.
+# torch/torchvision are Ultralytics dependencies; select a suitable CUDA build separately.
