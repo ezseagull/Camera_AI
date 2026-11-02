@@ -269,18 +269,26 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
             canvas = draw_regions(clean.copy(), polygon, crop_window)
             for person in people:
                 x1, y1, x2, y2 = person.box.astype(int)
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), (245, 180, 50), 2)
+                track_color = (245, 180, 50)  # Original color for unconfirmed tracks (BGR).
                 n = len(gallery.tracks[person.track_id]['samples'])
                 track_label = f'Track {person.track_id} | faces {n}'
                 if recognition_enabled:
                     result = identity_manager.get_result(person.track_id)
                     if result['identity_status'] == 'confirmed':
+                        track_color = (255, 0, 255)  # Magenta: confirmed identity (BGR).
                         track_label += f" | ID {result['person_id']}"
+                    elif (getattr(args, 'show_candidates', False)
+                          and result.get('candidate_person_id')):
+                        # Diagnostic display only: tentative candidate is NOT a confirmed ID.
+                        score = result.get('match_score')
+                        score_text = f' {score:.3f}' if score is not None else ''
+                        track_label += f" | ?{result['candidate_person_id']}{score_text} (PRED)"
                     else:
                         # A tentative candidate is never displayed as a verified name.
                         track_label += f" | {result['identity_status'].upper()}"
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), track_color, 2)
                 cv2.putText(canvas, track_label, (max(0, x1), max(50, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, .6, (245, 180, 50), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, .6, track_color, 2)
                 if len(trails[person.track_id]) >= 2:
                     cv2.polylines(canvas, [np.asarray(trails[person.track_id], dtype=np.int32)], False, (255, 170, 30), 2)
             for face, tid, reason, saved in face_labels:
@@ -366,6 +374,8 @@ def main():
     parser.add_argument('--at-second', type=float, default=0., help='Seek for ROI editing/preview only.')
     parser.add_argument('--headless', action='store_true')
     parser.add_argument('--max-frames', type=int, default=0)
+    parser.add_argument('--show-candidates', action='store_true',
+                        help='Show unverified candidate IDs in annotated video for diagnostic review only.')
     args = parser.parse_args()
     if args.max_frames < 0 or args.at_second < 0:
         parser.error('--max-frames and --at-second must be nonnegative')

@@ -1,119 +1,109 @@
-# All data/model paths except --source are relative to this configuration file.
 input:
   fallback_fps: 30.0
-
 roi:
   file: roi.json
-  # Example only: normalized x,y in the PROCESSED/UNDISTORTED image.
-  # Draw your own ROI with --edit-roi. If roi.json exists it overrides these points.
-  points: [[0.25, 0.08], [0.75, 0.08], [0.85, 0.92], [0.15, 0.92]]
-  context_margin_fraction: 0.12  # Padding in full-frame width/height for tracking.
-
+  points:
+  - - 0.25
+    - 0.08
+  - - 0.75
+    - 0.08
+  - - 0.85
+    - 0.92
+  - - 0.15
+    - 0.92
+  context_margin_fraction: 0.12
 undistort:
-  mode: none  # none | pinhole | fisheye; enable only with genuine calibration.
+  mode: none
   calibration_file: camera_calibration.npz
-  alpha: 0.0  # Pinhole: 0 crops more black borders, 1 keeps more field of view.
-  balance: 0.0  # Fisheye equivalent; re-draw ROI after changing geometry.
-
+  alpha: 0.0
+  balance: 0.0
 person:
   model: yolo26s.pt
   imgsz: 960
-  confidence: 0.10  # Keep <= track_low_thresh; low detections help recover tracks.
-  iou: 0.70
-  lost_seconds: 2.0  # Converted to frames using the video FPS; no frame skipping.
+  confidence: 0.1
+  iou: 0.7
+  lost_seconds: 2.0
   tracker:
     track_high_thresh: 0.35
-    track_low_thresh: 0.10
+    track_low_thresh: 0.1
     new_track_thresh: 0.45
-    match_thresh: 0.80
+    match_thresh: 0.8
     fuse_score: true
-    gmc_method: none  # Fixed camera. Try sparseOptFlow if the camera actually moves.
+    gmc_method: none
     with_reid: true
-    model: auto  # YOLO26 may fall back to yolo26n-cls.pt; appearance, not a person's name.
+    model: auto
     proximity_thresh: 0.35
-    appearance_thresh: 0.80
-
+    appearance_thresh: 0.8
 face:
-  model_pack: buffalo_l  # SCRFD-10G detector; only the detection module is used.
-  onnx_path: null  # Optional licensed five-landmark SCRFD .onnx, replaces model_pack.
-  input_size: [640, 640]
-  confidence: 0.40
+  model_pack: buffalo_l
+  onnx_path: null
+  input_size:
+  - 960
+  - 960
+  confidence: 0.4
   every_n_frames: 2
   crop_padding: 0.12
-  person_crop_height_fraction: 1.0  # Full person by default for a high/oblique camera.
-  rotation_angles: [-30, 30]  # Optional roll search, NOT pitch correction.
+  person_crop_height_fraction: 1.0
+  rotation_angles:
+  - -30
+  - 30
   rotation_every_n_frames: 6
   rotate_only_if_empty: true
-  nms_iou: 0.40
-
+  nms_iou: 0.4
 association:
   person_padding: 0.08
   min_face_coverage: 0.85
-  max_face_person_ratio: 0.90
-  expected_head_xy: [0.5, 0.25]  # Soft prior only, relative to the person bbox.
-  ambiguity_margin: 0.10  # Reject a face when two possible owners have similar cost.
-  max_cost: 0.70
-
+  max_face_person_ratio: 0.9
+  expected_head_xy:
+  - 0.5
+  - 0.25
+  ambiguity_margin: 0.1
+  max_cost: 0.7
 quality:
   min_det_score: 0.55
-  min_face_px: 32  # Measured BEFORE alignment/upscaling; try >=64 for enrollment.
+  min_face_px: 32
   min_eye_distance_px: 8
-  min_sharpness: 12.0  # Laplacian variance on a 112x112 grayscale crop; tune per camera.
+  min_sharpness: 12.0
   min_brightness: 25.0
   max_brightness: 230.0
-  # Recognition may also collect MEDIUM faces; the original quality_metrics()
-  # still uses the strict thresholds above, so legacy Gallery behavior is unchanged.
-  # These are experimental collection thresholds, NOT identity match thresholds.
   medium:
-    min_det_score: 0.45
-    min_face_px: 28
-    min_eye_distance_px: 6
-    min_sharpness: 7.0
+    min_det_score: 0.4
+    min_face_px: 24
+    min_eye_distance_px: 5
+    min_sharpness: 5.0
     min_brightness: 20.0
     max_brightness: 235.0
-
 gallery:
   top_k: 5
   min_track_observations: 3
-  min_sample_gap_s: 0.40  # Within this interval replace only if quality improves.
+  min_sample_gap_s: 0.4
   crop_padding: 0.18
   save_aligned: true
   aligned_size: 112
-  # Additional, separate archive used by Gallery.offer_recognition().
-  # Does NOT replace the existing top_k face gallery.
   recognition_high_k: 5
   recognition_medium_k: 10
-  recognition_min_sample_gap_s: 0.40
-
-# New ArcFace feature extractor; uses the SAME model version for enrollment
-# and video inference. These keys are consumed by enroll.py and will be used
-# by run.py after integration (current run.py does not enable recognition).
+  recognition_min_sample_gap_s: 0.4
 recognition:
-  enabled: false  # Change to true ONLY after enrollment and run.py integration.
-  model_pack: buffalo_l  # Loads ONLY w600k_r50.onnx; SCRFD remains in face.
-  onnx_path: null  # Optional custom InsightFace-compatible recognition ONNX.
-  model_id: null  # null => insightface/buffalo_l/w600k_r50 (auto-derived).
-  database_path: data/face_database.npz  # For future run.py; relative to config.
-
-# IdentityManager(database, cfg['identity']): decision policy, NOT the model.
-# Keep BOTH thresholds null until calibrated on held-out labeled camera video.
-# With null thresholds the model can report candidates but NEVER confirms IDs.
+  enabled: true
+  model_pack: buffalo_l
+  onnx_path: null
+  model_id: null
+  database_path: /content/data/face_database.npz
 identity:
-  min_match_score: null  # Calibrated cosine score, range [-1, 1].
-  min_margin: null  # Calibrated top-1 minus top-2 score, range [0, 2].
+  min_match_score: 0.2
+  min_margin: 0.07
   min_evidence: 3
   min_high_evidence: 1
   min_strong_support: 2
   min_vote_fraction: 0.75
   min_span_s: 0.8
-  min_sample_gap_s: 0.40
+  min_sample_gap_s: 0.4
   high_k: 5
   medium_k: 10
   medium_weight: 0.5
-  score_mode: centroid  # centroid | template_topk | max_template
-  template_top_k: 3  # Used when score_mode is template_topk.
-  allow_single_identity: false  # A single enrolled person has no top-2 margin.
-
+  score_mode: template_topk
+  template_top_k: 2
+  allow_single_identity: false
 output:
   directory: outputs
-  save_video: true  # Annotated MP4 has no audio.
+  save_video: true
