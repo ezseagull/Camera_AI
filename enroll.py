@@ -336,6 +336,8 @@ def main(argv=None):
     parser.add_argument('--report', help='Optional path for detailed enrollment JSON report.')
     parser.add_argument('--face-device', choices=('auto', 'cpu', 'cuda'), default='auto')
     parser.add_argument('--recognition-device', choices=('auto', 'cpu', 'cuda'), default='auto')
+    parser.add_argument('--enrollment-det-size', type=int, default=None,
+                        help='Optional square SCRFD input for enrollment only (e.g. 640); does not change video config.')
     parser.add_argument('--include-medium', action='store_true',
                         help='Explicitly allow medium-quality images for ENROLLMENT (higher risk).')
     parser.add_argument('--min-enrollment-face-px', type=float, default=64,
@@ -365,13 +367,21 @@ def main(argv=None):
     rec_cfg.setdefault('model_pack', cfg['face'].get('model_pack', 'buffalo_l'))
     from backends import FaceDetector, FaceRecognizer  # lazy model imports
 
-    detector = FaceDetector(cfg['face'], device=args.face_device,
+    # Enrollment-only SCRFD override: preserve the loaded YAML and video profile.
+    enrollment_face_cfg = dict(cfg['face'])
+    if args.enrollment_det_size is not None:
+        side = args.enrollment_det_size
+        if not (128 <= side <= 2048 and side % 32 == 0):
+            parser.error('--enrollment-det-size must be a multiple of 32 in [128, 2048].')
+        enrollment_face_cfg['input_size'] = [side, side]
+    print('Enrollment SCRFD input size:', enrollment_face_cfg['input_size'])
+    detector = FaceDetector(enrollment_face_cfg, device=args.face_device,
                             base_dir=config_path.parent)
     recognizer = FaceRecognizer(rec_cfg, device=args.recognition_device,
                                 base_dir=config_path.parent)
     report = enroll_dataset(
         args.dataset, args.output, detector=detector, recognizer=recognizer,
-        quality_cfg=cfg['quality'], face_cfg=cfg['face'], report_path=args.report,
+        quality_cfg=cfg['quality'], face_cfg=enrollment_face_cfg, report_path=args.report,
         include_medium=args.include_medium, overwrite=args.overwrite,
         review_cosine=args.review_cosine,
         require_all_identities=args.require_all_identities,

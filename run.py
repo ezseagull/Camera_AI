@@ -62,6 +62,39 @@ def load_roi(cfg, base_dir, rectifier, size):
     return polygon_pixels(points, *size)
 
 
+def load_tracking_window(cfg, base_dir, polygon, width, height):
+    """Optional fixed cyan tracking window; green capture ROI stays independent.
+
+    When roi.json has no tracking_window_pixels, preserve the original behavior.
+    Fixed coordinates refer to roi.json frame_size and scale with the video size.
+    """
+    dynamic_window = tracking_window(
+        polygon, width, height, cfg['roi']['context_margin_fraction'])
+    roi_path = (Path(base_dir) / cfg['roi']['file']).resolve()
+    if not roi_path.is_file():
+        return dynamic_window
+    roi_data = json.loads(roi_path.read_text(encoding='utf-8'))
+    fixed = roi_data.get('tracking_window_pixels')
+    if fixed is None:
+        return dynamic_window
+    reference_size = roi_data.get('frame_size')
+    if (not isinstance(reference_size, list) or len(reference_size) != 2
+            or not all(isinstance(v, (int, float)) and v > 0 for v in reference_size)):
+        raise ValueError('A fixed tracking window requires a valid ROI frame_size.')
+    coords = np.asarray(fixed, dtype=float)
+    if coords.shape != (4,) or not np.isfinite(coords).all():
+        raise ValueError('tracking_window_pixels must be four finite numbers [x1,y1,x2,y2].')
+    scale = np.asarray([width / reference_size[0], height / reference_size[1]] * 2)
+    window = np.rint(coords * scale).astype(int)
+    x1, y1, x2, y2 = window
+    if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+        raise ValueError('Fixed tracking window is outside the processed video frame.')
+    if (polygon[:, 0].min() < x1 or polygon[:, 0].max() >= x2
+            or polygon[:, 1].min() < y1 or polygon[:, 1].max() >= y2):
+        raise ValueError('Green face ROI extends outside fixed blue tracking window.')
+    return window
+
+
 def edit_roi(frame, cfg, base_dir, rectifier):
     h, w = frame.shape[:2]
     scale = min(1., 1280 / w, 780 / h)
@@ -147,7 +180,7 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
     """Backends may be injected for deterministic integration tests."""
     h, w = first_frame.shape[:2]
     polygon = load_roi(cfg, base_dir, rectifier, (w, h))
-    crop_window = tracking_window(polygon, w, h, cfg['roi']['context_margin_fraction'])
+    crop_window = load_tracking_window(cfg, base_dir, polygon, w, h)
     recognition_cfg = cfg.get('recognition', {})
     recognition_enabled = recognition_cfg.get('enabled', False)
     identity_records = []
@@ -193,6 +226,8 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
         }
     write_json(output_dir / 'run.json', meta)
     counters, history, trails = Counter(), {}, {}
+    # Diagnostic-only counters: no effect on ROI, matching, quality gates or identity decisions.
+    track_capture = {}
     started = time.perf_counter()
     frame_index, frame = 0, first_frame
     finish_reason = 'end_of_video'
@@ -204,6 +239,8 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
             timestamp = frame_index / fps  # Constant-frame-rate recorded video.
             for person in people:
                 gallery.observe(person.track_id, frame_index, timestamp)
+                capture = track_capture.setdefault(person.track_id, Counter())
+                capture['person_frames'] += 1
                 trail = trails.setdefault(person.track_id, deque(maxlen=45))
                 trail.append(tuple(np.rint((person.box[:2] + person.box[2:]) / 2).astype(int)))
             face_labels = []
@@ -215,12 +252,15 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                 counters['unassigned_faces'] += len(faces) - len(pairs)
                 for pi, fi in pairs:
                     person, face = people[pi], faces[fi]
+                    track_capture[person.track_id]['face_matches'] += 1
                     center = (face.box[:2] + face.box[2:]) / 2
                     relative = (center - person.box[:2]) / np.maximum(person.box[2:] - person.box[:2], 1)
                     history[person.track_id] = (frame_index, relative)
                     if not inside_polygon(center, polygon):
                         counters['outside_roi'] += 1
+                        track_capture[person.track_id]['face_outside_green_roi'] += 1
                         continue
+                    track_capture[person.track_id]['face_inside_green_roi'] += 1
                     metrics, reason = quality_metrics(clean, face, cfg['quality'], rectifier.valid_mask)
                     counters['quality_' + reason] += 1
                     saved = False
@@ -233,7 +273,9 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                         rec_metrics, tier = recognition_quality_metrics(
                             clean, face, cfg['quality'], rectifier.valid_mask)
                         counters['recognition_quality_' + tier] += 1
+                        track_capture[person.track_id]['quality_' + tier] += 1
                         if rec_metrics is not None:
+                            track_capture[person.track_id]['recognition_offers'] += 1
                             archived = gallery.offer_recognition(
                                 person, face, rec_metrics, clean, frame_index, timestamp, tier=tier)
                             counters['recognition_gallery_updates'] += int(archived)
@@ -346,6 +388,22 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                 'thresholds_configured': meta['recognition']['thresholds_configured'],
                 'tracks': identity_records,
             })
+            # Each face observation is diagnostic only, not a unique person.
+            identity_by_track = {x['track_id']: x for x in identity_records}
+            write_json(output_dir / 'face_capture_diagnostics.json', {
+                'schema_version': 1,
+                'notes': 'Counts are frame-level and track-level observations, not unique people or independent embeddings.',
+                'tracks': [
+                    {
+                        'track_id': tid,
+                        **dict(counts),
+                        'evidence_count': identity_by_track.get(tid, {}).get('evidence_count', 0),
+                        'identity_status': identity_by_track.get(tid, {}).get('identity_status', 'pending'),
+                        'identity_reason': identity_by_track.get(tid, {}).get('reason', 'not_finalized'),
+                    }
+                    for tid, counts in sorted(track_capture.items())
+                ],
+            })
             counters['identity_tracks_finalized'] = len(identity_records)
             counters['identity_tracks_confirmed'] = sum(
                 item['identity_status'] == 'confirmed' for item in identity_records)
@@ -408,7 +466,7 @@ def main():
             edit_roi(processed, cfg, base_dir, rectifier)
         elif args.preview_roi:
             polygon = load_roi(cfg, base_dir, rectifier, first.shape[1::-1])
-            window = tracking_window(polygon, first.shape[1], first.shape[0], cfg['roi']['context_margin_fraction'])
+            window = load_tracking_window(cfg, base_dir, polygon, first.shape[1], first.shape[0])
             path = base_dir / 'roi_preview.jpg'
             write_image(path, draw_regions(processed.copy(), polygon, window))
             print('ROI preview:', path)
