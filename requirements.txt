@@ -6,5 +6,14 @@ numpy>=1.26,<3
 scipy>=1.11,<2
 PyYAML>=6,<7
 lap>=0.5.12,<1
-# InsightFace installs CPU ONNX Runtime. For NVIDIA, replace it AFTER installation.
+# Face Recognition/enrollment/identity management use the existing packages above:
+# - SCRFD + ArcFace are provided through insightface==2.0 (no extra recognition package).
+# - numpy/scipy/OpenCV/PyYAML support face_database.py, enroll.py and run.py.
+# InsightFace installs CPU ONNX Runtime by default. For NVIDIA, uninstall
+# onnxruntime AFTER installation, then install a matching onnxruntime-gpu wheel.
+# Do not install both ONNX Runtime distributions in the same environment.
+# On Jetson ARM64, select a wheel for its JetPack/Python/CUDA/cuDNN versions;
+# do NOT assume that the generic GPU pip wheel will work on every Jetson.
 # torch/torchvision are Ultralytics dependencies; select a suitable CUDA build separately.
+# Developer-only tests: python -m pip install pytest (not required for inference).
+# Model weights (e.g. buffalo_l) and face_database.npz are NOT pip dependencies.

@@ -15,10 +15,10 @@ import cv2
 import numpy as np
 import yaml
 
-from backends import FaceDetector, PersonTracker
+from backends import FaceDetector, FaceRecognizer, PersonTracker
 from gallery import Gallery, write_image, write_json
-from vision import (Rectifier, associate_faces, draw_regions, inside_polygon,
-                    polygon_pixels, quality_metrics, tracking_window)
+from vision import (Rectifier, associate_faces, box_iou, draw_regions, inside_polygon,
+                    polygon_pixels, quality_metrics, recognition_quality_metrics, tracking_window)
 
 
 def read_config(path):
@@ -34,6 +34,17 @@ def read_config(path):
         raise ValueError('person_crop_height_fraction must be in (0,1].')
     if not 0 <= cfg['roi']['context_margin_fraction'] <= 1:
         raise ValueError('context_margin_fraction must be in [0,1].')
+    # Recognition is strictly opt-in; preserve legacy execution when disabled.
+    recognition_cfg = cfg.get('recognition', {})
+    if not isinstance(recognition_cfg, dict):
+        raise ValueError('recognition must be a YAML mapping.')
+    if type(recognition_cfg.get('enabled', False)) is not bool:
+        raise ValueError('recognition.enabled must be true or false.')
+    if recognition_cfg.get('enabled', False):
+        if not recognition_cfg.get('database_path'):
+            raise ValueError('recognition.database_path is required when recognition is enabled.')
+        if not isinstance(cfg.get('identity'), dict):
+            raise ValueError('identity must be a YAML mapping when recognition is enabled.')
     return cfg
 
 
@@ -132,11 +143,29 @@ def package_versions():
 
 
 def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_dir,
-                  tracker=None, face_detector=None):
+                  tracker=None, face_detector=None, recognizer=None, identity_manager=None):
     """Backends may be injected for deterministic integration tests."""
     h, w = first_frame.shape[:2]
     polygon = load_roi(cfg, base_dir, rectifier, (w, h))
     crop_window = tracking_window(polygon, w, h, cfg['roi']['context_margin_fraction'])
+    recognition_cfg = cfg.get('recognition', {})
+    recognition_enabled = recognition_cfg.get('enabled', False)
+    identity_records = []
+    if recognition_enabled:
+        # Do not load recognition models or the enrollment database for ROI editing
+        # or when running the original tracking/gallery-only pipeline.
+        if identity_manager is None:
+            from face_database import FaceDatabase
+            from identity_manager import IdentityManager
+            database_path = (Path(base_dir) / recognition_cfg['database_path']).resolve()
+            if not database_path.is_file():
+                raise FileNotFoundError(f'Enrollment database not found: {database_path}. Run enroll.py first.')
+            database = FaceDatabase.load(database_path)
+            identity_manager = IdentityManager(database, cfg['identity'])
+        if recognizer is None:
+            recognizer = FaceRecognizer(recognition_cfg, args.face_device, base_dir)
+        # Fail closed: no silent identity matching with a different ArcFace model.
+        identity_manager.verify_recognizer(recognizer)
     tracker = tracker or PersonTracker(cfg['person'], fps, output_dir, args.device)
     face_detector = face_detector or FaceDetector(cfg['face'], args.face_device, base_dir)
     gallery = Gallery(output_dir / 'faces', cfg['gallery'])
@@ -152,6 +181,16 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
             'tracking_window': crop_window.tolist(), 'rectification_signature': rectifier.signature,
             'versions': package_versions(), 'identity_scope': 'temporary_track_in_this_run',
             'coordinate_space': 'full_processed_frame', 'status': 'running'}
+    if recognition_enabled:
+        meta['identity_scope'] = 'enrolled_person_id_and_temporary_track'
+        meta['recognition'] = {
+            'enabled': True,
+            'database_path': str((Path(base_dir) / recognition_cfg['database_path']).resolve()),
+            'model_id': identity_manager.database.model_id,
+            'enrolled_identities': len(identity_manager.database),
+            'enrolled_templates': identity_manager.database.total_templates,
+            'thresholds_configured': identity_manager.thresholds_configured,
+        }
     write_json(output_dir / 'run.json', meta)
     counters, history, trails = Counter(), {}, {}
     started = time.perf_counter()
@@ -188,14 +227,59 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                     if metrics is not None:
                         saved = gallery.offer(person, face, metrics, clean, frame_index, timestamp)
                         counters['gallery_updates'] += int(saved)
+                    if recognition_enabled:
+                        # Keep relaxed recognition evidence independent of the
+                        # original (unchanged) strict top-K gallery selection.
+                        rec_metrics, tier = recognition_quality_metrics(
+                            clean, face, cfg['quality'], rectifier.valid_mask)
+                        counters['recognition_quality_' + tier] += 1
+                        if rec_metrics is not None:
+                            archived = gallery.offer_recognition(
+                                person, face, rec_metrics, clean, frame_index, timestamp, tier=tier)
+                            counters['recognition_gallery_updates'] += int(archived)
+                            counters['recognition_attempts'] += 1
+                            identity_manager.observe_face(
+                                person, face, rec_metrics, clean, frame_index, timestamp,
+                                recognizer, tier=tier, association_ok=True)
                     face_labels.append((face, person.track_id, reason, saved))
+            if recognition_enabled:
+                # Only flag simultaneous ID collisions for visibly distinct,
+                # non-overlapping tracks. Occluded/overlapping detections alone
+                # cannot prove that two tracks represent different people.
+                for index, person in enumerate(people):
+                    result = identity_manager.get_result(person.track_id)
+                    if result['identity_status'] != 'confirmed':
+                        continue
+                    for other in people[:index]:
+                        other_result = identity_manager.get_result(other.track_id)
+                        if (other_result['identity_status'] == 'confirmed'
+                                and other_result['person_id'] == result['person_id']
+                                and box_iou(person.box, other.box) < 0.1):
+                            identity_manager.mark_conflict(
+                                person.track_id, 'same_identity_on_distinct_simultaneous_tracks')
+                            identity_manager.mark_conflict(
+                                other.track_id, 'same_identity_on_distinct_simultaneous_tracks')
+                            counters['identity_simultaneous_conflicts'] += 1
+                            break
+                # Gallery.finalize()/expire() write the track metadata; attach a
+                # current JSON-safe identity summary before that happens.
+                for person in people:
+                    gallery.tracks[person.track_id]['identity'] = identity_manager.get_result(person.track_id)
             # Annotate only after cropping/saving from the clean frame.
             canvas = draw_regions(clean.copy(), polygon, crop_window)
             for person in people:
                 x1, y1, x2, y2 = person.box.astype(int)
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), (245, 180, 50), 2)
                 n = len(gallery.tracks[person.track_id]['samples'])
-                cv2.putText(canvas, f'Track {person.track_id} | faces {n}', (max(0, x1), max(50, y1 - 8)),
+                track_label = f'Track {person.track_id} | faces {n}'
+                if recognition_enabled:
+                    result = identity_manager.get_result(person.track_id)
+                    if result['identity_status'] == 'confirmed':
+                        track_label += f" | ID {result['person_id']}"
+                    else:
+                        # A tentative candidate is never displayed as a verified name.
+                        track_label += f" | {result['identity_status'].upper()}"
+                cv2.putText(canvas, track_label, (max(0, x1), max(50, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, .6, (245, 180, 50), 2)
                 if len(trails[person.track_id]) >= 2:
                     cv2.polylines(canvas, [np.asarray(trails[person.track_id], dtype=np.int32)], False, (255, 170, 30), 2)
@@ -211,6 +295,8 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
             for tid in gallery.expire(frame_index, tracker.lost_frames):
                 history.pop(tid, None)
                 trails.pop(tid, None)
+                if recognition_enabled:
+                    identity_records.append(identity_manager.finalize_track(tid))
             counters['frames'] += 1
             elapsed = time.perf_counter() - started
             cv2.putText(canvas, f'Frame {frame_index} | processing {counters["frames"] / max(elapsed, .001):.1f} fps',
@@ -237,7 +323,26 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
         finish_reason = 'error'
         raise
     finally:
+        if recognition_enabled:
+            # Final results are written even for early stops and interruptions.
+            for tid in list(gallery.tracks):
+                summary = identity_manager.finalize_track(tid)
+                gallery.tracks[tid]['identity'] = summary
+                identity_records.append(summary)
+            identity_manager.close()
         gallery.close(finish_reason)
+        if recognition_enabled:
+            write_json(output_dir / 'identities.json', {
+                'status': finish_reason,
+                'model_id': meta['recognition']['model_id'],
+                'thresholds_configured': meta['recognition']['thresholds_configured'],
+                'tracks': identity_records,
+            })
+            counters['identity_tracks_finalized'] = len(identity_records)
+            counters['identity_tracks_confirmed'] = sum(
+                item['identity_status'] == 'confirmed' for item in identity_records)
+            counters['identity_tracks_conflict'] = sum(
+                item['identity_status'] == 'conflict' for item in identity_records)
         if writer is not None:
             writer.release()
         if not args.headless:

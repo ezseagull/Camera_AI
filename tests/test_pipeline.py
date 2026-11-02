@@ -196,3 +196,192 @@ def test_pipeline_outputs_clean_faces_updates_every_frame_and_respects_roi(tmp_p
     ok, image = video.read()
     video.release()
     assert ok and image.shape == source.shape
+
+
+# ---------------------------------------------------------------------------
+# Additional regression coverage for the opt-in face-recognition extension.
+# The original ROI, tracker, face-detector and legacy gallery tests above are
+# unchanged. Synthetic pixels/embeddings are NOT a real-world accuracy measure.
+# ---------------------------------------------------------------------------
+
+
+def test_recognition_quality_accepts_high_without_changing_legacy(cfg):
+    from vision import recognition_quality_metrics
+
+    frame = np.random.default_rng(101).integers(40, 210, (240, 320, 3), dtype=np.uint8)
+    face = make_face()
+    original, original_reason = quality_metrics(frame, face, cfg['quality'])
+    recognized, tier = recognition_quality_metrics(frame, face, cfg['quality'])
+
+    assert original_reason == 'ok' and tier == 'high'
+    assert recognized['quality_tier'] == 'high'
+    assert recognized['score'] == original['score']
+    # Original strict API must remain unchanged, even after recognition calls.
+    assert quality_metrics(frame, face, cfg['quality']) == (original, 'ok')
+
+
+@pytest.mark.parametrize('face, strict_reason', [
+    (make_face(confidence=.50), 'confidence'),
+    (make_face((40, 30, 70, 65)), 'small'),
+])
+def test_recognition_quality_retains_medium_faces(cfg, face, strict_reason):
+    from vision import recognition_quality_metrics
+
+    frame = np.random.default_rng(102).integers(50, 210, (240, 320, 3), dtype=np.uint8)
+    assert quality_metrics(frame, face, cfg['quality'])[1] == strict_reason
+    metrics, tier = recognition_quality_metrics(frame, face, cfg['quality'])
+    assert tier == 'medium'
+    assert metrics['quality_tier'] == 'medium'
+    assert metrics['strict_rejection_reason'] == strict_reason
+    assert 0 < metrics['score'] <= 1
+
+
+@pytest.mark.parametrize('invalid', ['bad_landmarks', 'dewarp_border', 'too_small'])
+def test_recognition_quality_never_bypasses_invalid_faces(cfg, invalid):
+    from vision import recognition_quality_metrics
+
+    frame = np.random.default_rng(103).integers(50, 210, (240, 320, 3), dtype=np.uint8)
+    face = make_face()
+    mask = None
+    if invalid == 'bad_landmarks':
+        face.landmarks[2, 0] = np.nan
+    elif invalid == 'dewarp_border':
+        mask = np.zeros((240, 320), dtype=np.uint8)
+    else:
+        face = make_face((40, 30, 54, 44))
+    metrics, reason = recognition_quality_metrics(frame, face, cfg['quality'], mask)
+    assert metrics is None
+    assert reason == {'bad_landmarks': 'landmarks',
+                      'dewarp_border': 'dewarp_border',
+                      'too_small': 'small'}[invalid]
+
+
+def test_recognition_gallery_is_separate_bounded_and_high_preferred(tmp_path, cfg):
+    settings = {**cfg['gallery'], 'min_track_observations': 1,
+                'recognition_high_k': 1, 'recognition_medium_k': 2,
+                'recognition_min_sample_gap_s': .4}
+    gallery = Gallery(tmp_path / 'faces', settings)
+    frame = np.random.default_rng(104).integers(40, 210, (240, 320, 3), dtype=np.uint8)
+    person = Person(7, np.array([10., 10., 110., 220.]), .95)
+    face = make_face()
+
+    def offer(index, stamp, score, tier):
+        gallery.observe(7, index, stamp)
+        return gallery.offer_recognition(person, face,
+                                         {'score': score, 'quality_tier': tier},
+                                         frame, index, stamp, tier=tier)
+
+    assert offer(0, 0., .40, 'medium')
+    assert not offer(1, .1, .30, 'medium')  # Worse duplicate in same time interval.
+    assert offer(2, .2, .50, 'medium')      # Better medium replaces earlier image.
+    assert offer(3, .3, .70, 'high')        # High takes priority over nearby medium.
+    assert not offer(4, .5, .95, 'medium') # Cannot displace nearby high.
+    assert offer(10, 1.0, .55, 'medium')
+    assert offer(20, 2.0, .60, 'medium')
+    assert offer(30, 3.0, .80, 'medium')  # Capacity reached: evict weaker medium.
+    assert offer(40, 4.0, .85, 'high')    # High capacity reached: replace older high.
+
+    track = gallery.tracks[7]
+    assert track['samples'] == []  # Legacy Gallery.offer() remains independent.
+    assert len(track['recognition_samples']['high']) == 1
+    assert len(track['recognition_samples']['medium']) == 2
+    assert {s['frame_index'] for s in track['recognition_samples']['high']} == {40}
+    assert {s['frame_index'] for s in track['recognition_samples']['medium']} == {20, 30}
+    directory = tmp_path / 'faces' / 'track_000007'
+    for tier in ('high', 'medium'):
+        for sample in track['recognition_samples'][tier]:
+            assert (directory / sample['crop_file']).is_file()
+            assert (directory / sample['aligned_file']).is_file()
+    assert not (directory / 'recognition/medium/frame_000000000_crop.jpg').exists()
+    assert not (directory / 'recognition/high/frame_000000003_crop.jpg').exists()
+    gallery.close()
+    summary = json.loads((tmp_path / 'tracks.jsonl').read_text().splitlines()[0])
+    assert summary['track_id'] == 7
+    assert len(summary['recognition_samples']['medium']) == 2
+
+
+def test_recognition_gallery_track_without_legacy_samples_is_finalized(tmp_path, cfg):
+    settings = {**cfg['gallery'], 'min_track_observations': 1}
+    gallery = Gallery(tmp_path / 'faces', settings)
+    face = make_face()
+    person = Person(9, np.array([10., 10., 110., 220.]), .90)
+    frame = np.full((240, 320, 3), 128, dtype=np.uint8)
+    gallery.observe(9, 0, 0.)
+    assert gallery.offer_recognition(person, face, {'score': .65, 'quality_tier': 'medium'},
+                                     frame, 0, 0., tier='medium')
+    assert gallery.expire(10, lost_frames=2) == [9]
+    track = json.loads((tmp_path / 'faces/track_000009/meta.json').read_text())
+    assert track['samples'] == []
+    assert len(track['recognition_samples']['medium']) == 1
+    assert track['finalized_reason'] == 'lost_timeout'
+    assert 9 not in gallery.tracks
+
+
+def test_pipeline_medium_faces_collect_evidence_without_false_confirmation(tmp_path, cfg):
+    """One-person mocked video: strict gallery rejects small face, recognition keeps it."""
+    import hashlib
+    from face_database import FaceDatabase
+
+    config = deepcopy(cfg)
+    config['roi']['points'] = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]]
+    config['gallery']['min_track_observations'] = 1
+    config['recognition']['enabled'] = True
+    assert config['identity']['min_match_score'] is None
+    assert config['identity']['min_margin'] is None
+
+    model = tmp_path / 'dummy.onnx'
+    model.write_bytes(b'synthetic model - test only')
+    database = FaceDatabase(model_id='test/arcface',
+                            model_sha256=hashlib.sha256(model.read_bytes()).hexdigest())
+    database.add_identity('SV001', [[1., 0., 0.]])
+    database.add_identity('SV002', [[0., 1., 0.]])
+    database.save(tmp_path / 'registered.npz')
+    config['recognition']['database_path'] = 'registered.npz'
+
+    frame = np.random.default_rng(105).integers(60, 200, (240, 320, 3), dtype=np.uint8)
+
+    class Capture:
+        def __init__(self):
+            self.remaining = 17
+        def read(self):
+            if self.remaining == 0:
+                return False, None
+            self.remaining -= 1
+            return True, frame.copy()
+
+    class Tracker:
+        lost_frames = 10
+        def update(self, image, window):
+            return [Person(1, np.array([10., 10., 110., 220.]), .95)]
+
+    class Detector:
+        def detect(self, image, people, index):
+            return [make_face((40, 30, 70, 65), confidence=.95)]
+
+    class Recognizer:
+        model_path = str(model)
+        cfg = {'model_id': 'test/arcface'}
+        def get_embedding(self, image, face):
+            # Embedding from an unannotated full-frame BGR image.
+            np.testing.assert_array_equal(image, frame)
+            return np.array([1., 0., 0.], dtype=np.float32)
+
+    args = SimpleNamespace(source='synthetic', device='cpu', face_device='cpu',
+                           headless=True, max_frames=0)
+    rectifier = Rectifier(config['undistort'], (320, 240), tmp_path)
+    meta = process_video(Capture(), frame, config, tmp_path, args, rectifier, 10., tmp_path,
+                         tracker=Tracker(), face_detector=Detector(), recognizer=Recognizer())
+    summary = json.loads((tmp_path / 'identities.json').read_text())
+    track = json.loads((tmp_path / 'faces/track_000001/meta.json').read_text())
+
+    assert meta['counters']['frames'] == 18
+    assert meta['counters'].get('gallery_updates', 0) == 0
+    assert meta['counters']['recognition_gallery_updates'] > 0
+    assert track['samples'] == []  # Strict gallery still excludes the 30-pixel face.
+    assert track['recognition_samples']['medium']
+    assert not track['recognition_samples']['high']
+    assert summary['thresholds_configured'] is False
+    assert len(summary['tracks']) == 1
+    assert summary['tracks'][0]['person_id'] is None
+    assert summary['tracks'][0]['identity_status'] in ('pending', 'unknown')
+    assert track['identity']['person_id'] is None

@@ -295,3 +295,64 @@ def draw_regions(frame, polygon, window):
     cv2.putText(frame, 'GREEN: capture ROI | CYAN: tracking context', (15, 27),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
     return frame
+
+
+def recognition_quality_metrics(frame, face, cfg, valid_mask=None):
+    """Classify face evidence as high, medium, or rejected without changing legacy gates.
+
+    Returns (metrics, tier) for accepted faces, with tier 'high' or 'medium'.
+    Rejected faces return (None, reason), preserving quality_metrics' reason strings.
+    'High' means passing the existing heuristic, NOT verified identity quality.
+
+    Optional cfg['medium'] overrides the initial relaxed thresholds. The
+    geometrical landmark check and undistortion-border check are NEVER relaxed.
+    Neither tier grants permission to confirm a person's identity by itself.
+    """
+    metrics, strict_reason = quality_metrics(frame, face, cfg, valid_mask)
+    if metrics is not None:
+        return {**metrics, 'quality_tier': 'high'}, 'high'
+
+    # Never allow a weaker quality threshold to bypass an unsafe crop/landmark.
+    if strict_reason in ('landmarks', 'dewarp_border'):
+        return None, strict_reason
+
+    # Tentative starting points for small overhead-camera faces, NOT calibrated
+    # face-recognition thresholds. Tune with held-out, identity-labeled footage.
+    medium_defaults = {
+        'min_det_score': 0.45,
+        'min_face_px': 28,
+        'min_eye_distance_px': 6,
+        'min_sharpness': 7.0,
+        'min_brightness': 20.0,
+        'max_brightness': 235.0,
+    }
+    user_medium = cfg.get('medium', {})
+    if not isinstance(user_medium, dict):
+        raise TypeError('quality.medium must be a mapping of threshold overrides.')
+    unexpected = set(user_medium) - set(medium_defaults)
+    if unexpected:
+        raise ValueError(f'Unknown quality.medium settings: {sorted(unexpected)}')
+
+    relaxed_cfg = dict(cfg)
+    for name, default in medium_defaults.items():
+        requested = float(user_medium.get(name, default))
+        if not np.isfinite(requested):
+            raise ValueError(f'quality.medium.{name} must be finite.')
+        if name == 'max_brightness':
+            relaxed_cfg[name] = max(float(cfg[name]), requested)
+        else:
+            relaxed_cfg[name] = min(float(cfg[name]), requested)
+
+    # Do not use invalid/degenerate parameters to admit arbitrarily bad faces.
+    if not (0 <= relaxed_cfg['min_det_score'] <= 1
+            and relaxed_cfg['min_face_px'] >= 1
+            and relaxed_cfg['min_eye_distance_px'] > 0
+            and relaxed_cfg['min_sharpness'] >= 0
+            and 0 <= relaxed_cfg['min_brightness'] <= relaxed_cfg['max_brightness'] <= 255):
+        raise ValueError('Invalid medium-quality thresholds.')
+
+    medium_metrics, medium_reason = quality_metrics(frame, face, relaxed_cfg, valid_mask)
+    if medium_metrics is None:
+        return None, medium_reason
+    return {**medium_metrics, 'quality_tier': 'medium',
+            'strict_rejection_reason': strict_reason}, 'medium'

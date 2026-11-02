@@ -61,6 +61,16 @@ quality:
   min_sharpness: 12.0  # Laplacian variance on a 112x112 grayscale crop; tune per camera.
   min_brightness: 25.0
   max_brightness: 230.0
+  # Recognition may also collect MEDIUM faces; the original quality_metrics()
+  # still uses the strict thresholds above, so legacy Gallery behavior is unchanged.
+  # These are experimental collection thresholds, NOT identity match thresholds.
+  medium:
+    min_det_score: 0.45
+    min_face_px: 28
+    min_eye_distance_px: 6
+    min_sharpness: 7.0
+    min_brightness: 20.0
+    max_brightness: 235.0
 
 gallery:
   top_k: 5
@@ -69,6 +79,40 @@ gallery:
   crop_padding: 0.18
   save_aligned: true
   aligned_size: 112
+  # Additional, separate archive used by Gallery.offer_recognition().
+  # Does NOT replace the existing top_k face gallery.
+  recognition_high_k: 5
+  recognition_medium_k: 10
+  recognition_min_sample_gap_s: 0.40
+
+# New ArcFace feature extractor; uses the SAME model version for enrollment
+# and video inference. These keys are consumed by enroll.py and will be used
+# by run.py after integration (current run.py does not enable recognition).
+recognition:
+  enabled: false  # Change to true ONLY after enrollment and run.py integration.
+  model_pack: buffalo_l  # Loads ONLY w600k_r50.onnx; SCRFD remains in face.
+  onnx_path: null  # Optional custom InsightFace-compatible recognition ONNX.
+  model_id: null  # null => insightface/buffalo_l/w600k_r50 (auto-derived).
+  database_path: data/face_database.npz  # For future run.py; relative to config.
+
+# IdentityManager(database, cfg['identity']): decision policy, NOT the model.
+# Keep BOTH thresholds null until calibrated on held-out labeled camera video.
+# With null thresholds the model can report candidates but NEVER confirms IDs.
+identity:
+  min_match_score: null  # Calibrated cosine score, range [-1, 1].
+  min_margin: null  # Calibrated top-1 minus top-2 score, range [0, 2].
+  min_evidence: 3
+  min_high_evidence: 1
+  min_strong_support: 2
+  min_vote_fraction: 0.75
+  min_span_s: 0.8
+  min_sample_gap_s: 0.40
+  high_k: 5
+  medium_k: 10
+  medium_weight: 0.5
+  score_mode: centroid  # centroid | template_topk | max_template
+  template_top_k: 3  # Used when score_mode is template_topk.
+  allow_single_identity: false  # A single enrolled person has no top-2 margin.
 
 output:
   directory: outputs

@@ -131,3 +131,91 @@ class FaceDetector:
                         found.extend(self._detect_crop(crop, offset, float(angle)))
             all_faces.extend(found)
         return nms_faces(all_faces, self.cfg['nms_iou'])
+
+
+class FaceRecognizer:
+    """Extract L2-normalized ArcFace embeddings; identity matching belongs elsewhere.
+
+    Input frames and aligned crops use OpenCV BGR uint8 format. Face.landmarks
+    must contain five points in FULL processed-frame coordinates, as returned
+    by FaceDetector. This class never decides or assigns a person identity.
+    """
+
+    def __init__(self, cfg, device='auto', base_dir='.'):
+        # Keep inference imports lazy, as in FaceDetector.
+        import torch  # noqa: F401
+        import onnxruntime as ort
+        from insightface import model_zoo
+        from insightface.utils import ensure_available, face_align
+
+        self.cfg = cfg
+        available = ort.get_available_providers()
+        cuda = device != 'cpu' and 'CUDAExecutionProvider' in available
+        if device == 'cuda' and not cuda:
+            raise RuntimeError('CUDAExecutionProvider unavailable. Install compatible onnxruntime-gpu or use CPU recognition.')
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if cuda else ['CPUExecutionProvider']
+
+        model_path = cfg.get('onnx_path')
+        if model_path:
+            path = (Path(base_dir) / model_path).resolve()
+        else:
+            # Reuse the same downloaded model pack as SCRFD, but load ONLY ArcFace.
+            # No second face detector is allocated on the Jetson.
+            pack = cfg.get('model_pack', 'buffalo_l')
+            model_dir = Path(ensure_available('models', pack)).expanduser()
+            path = model_dir / 'w600k_r50.onnx'
+        if not path.is_file():
+            raise FileNotFoundError(f'ArcFace recognition ONNX model not found: {path}')
+
+        self.model = model_zoo.get_model(str(path), providers=providers)
+        if self.model is None or self.model.taskname != 'recognition':
+            raise ValueError('recognition.onnx_path must point to an InsightFace-compatible recognition model.')
+        self.model.prepare(ctx_id=0 if cuda else -1)
+        active = self.model.session.get_providers()
+        print('Face recognizer ONNX providers:', active)
+        if device == 'cuda' and 'CUDAExecutionProvider' not in active:
+            raise RuntimeError('Recognition ONNX fell back to CPU; check CUDA/cuDNN installation or select CPU explicitly.')
+
+        input_size = tuple(self.model.input_size)
+        if len(input_size) != 2 or input_size[0] != input_size[1] or (input_size[0] % 112 and input_size[0] % 128):
+            raise ValueError('ArcFace alignment requires a square model input divisible by 112 or 128.')
+        self.input_size = int(input_size[0])
+        self.model_path = str(path)
+        self._face_align = face_align
+
+    def get_embedding(self, frame, face):
+        """Return unit-L2 float32 embedding, or None for unusable landmarks.
+
+        Use the original, unannotated BGR frame. The five landmarks are in
+        full-frame coordinates (not relative to a person or face crop).
+        """
+        self._validate_image(frame)
+        landmarks = np.asarray(face.landmarks, dtype=np.float32)
+        if landmarks.shape != (5, 2) or not np.isfinite(landmarks).all():
+            return None
+        h, w = frame.shape[:2]
+        if (landmarks < 0).any() or (landmarks[:, 0] >= w).any() or (landmarks[:, 1] >= h).any():
+            return None
+        if np.linalg.norm(landmarks[0] - landmarks[1]) < 1.0:
+            return None
+        aligned = self._face_align.norm_crop(frame, landmark=landmarks, image_size=self.input_size)
+        return self.get_embedding_from_aligned(aligned)
+
+    def get_embedding_from_aligned(self, aligned_bgr):
+        """Embedding for an ALREADY aligned face (avoid aligning twice)."""
+        self._validate_image(aligned_bgr)
+        if aligned_bgr.shape[:2] != (self.input_size, self.input_size):
+            raise ValueError(f'Expected aligned face of size {self.input_size}x{self.input_size}.')
+        # InsightFace get_feat owns RGB channel swapping and ONNX normalization.
+        vector = np.asarray(self.model.get_feat(np.ascontiguousarray(aligned_bgr)), dtype=np.float32).reshape(-1)
+        if not vector.size or not np.isfinite(vector).all():
+            return None
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm) or norm <= 1e-12:
+            return None
+        return np.ascontiguousarray(vector / norm, dtype=np.float32)
+
+    @staticmethod
+    def _validate_image(image):
+        if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8 or not image.shape[0] or not image.shape[1]:
+            raise ValueError('Expected non-empty OpenCV BGR uint8 image with shape (height, width, 3).')
