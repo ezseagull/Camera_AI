@@ -126,7 +126,14 @@ class Gallery:
         if person.track_id not in self.tracks:
             raise KeyError('Call observe() before offer_recognition().')
         track = self.tracks[person.track_id]
-        if track['observations'] < self.cfg['min_track_observations']:
+        # Image archiving is independent of the IdentityManager evidence bank.
+        # Preserve the old gate by default; optionally archive early high/medium
+        # faces for reviewing identity decisions made in the first track frames.
+        min_observations = self.cfg.get(
+            'recognition_min_track_observations', self.cfg['min_track_observations'])
+        if type(min_observations) is not int or min_observations < 1:
+            raise ValueError('recognition_min_track_observations must be a positive integer.')
+        if track['observations'] < min_observations:
             return False
 
         import math

@@ -121,6 +121,50 @@ def inside_polygon(point, polygon):
     return cv2.pointPolygonTest(polygon, tuple(map(float, point)), False) >= 0
 
 
+def roi_point_diagnostics(point, polygon):
+    """Describe a point relative to the existing green ROI, WITHOUT changing it.
+
+    Distances are in full processed-frame pixels. ``signed_distance_px`` is
+    positive inside, negative outside and zero on the boundary. ``side`` is
+    only a geometric direction from the nearest edge toward an outside point;
+    it is not a semantic entrance/exit direction for a concave polygon.
+    """
+    p = np.asarray(point, dtype=np.float64)
+    vertices = np.asarray(polygon, dtype=np.float64)
+    if p.shape != (2,) or not np.isfinite(p).all():
+        raise ValueError('ROI diagnostic point must be a finite [x, y] pair.')
+    if vertices.ndim != 2 or vertices.shape[1] != 2 or len(vertices) < 3 or not np.isfinite(vertices).all():
+        raise ValueError('ROI diagnostic polygon must have at least three finite vertices.')
+    contour = np.ascontiguousarray(vertices.astype(np.float32))
+    signed = float(cv2.pointPolygonTest(contour, tuple(map(float, p)), True))
+    nearest_xy, nearest_index = None, None
+    nearest_distance_sq = float('inf')
+    for edge_index, a in enumerate(vertices):
+        b = vertices[(edge_index + 1) % len(vertices)]
+        ab = b - a
+        length_sq = float(ab @ ab)
+        t = float(np.clip(((p - a) @ ab) / length_sq, 0., 1.)) if length_sq else 0.
+        nearest = a + t * ab
+        dist_sq = float(np.sum((p - nearest) ** 2))
+        if dist_sq < nearest_distance_sq:
+            nearest_xy, nearest_index, nearest_distance_sq = nearest, edge_index, dist_sq
+    side = None
+    if signed < 0:
+        offset = p - nearest_xy
+        if abs(offset[0]) >= abs(offset[1]):
+            side = 'left' if offset[0] < 0 else 'right'
+        else:
+            side = 'top' if offset[1] < 0 else 'bottom'
+    return {
+        'inside': bool(signed >= 0),
+        'signed_distance_px': round(signed, 3),
+        'distance_to_border_px': round(float(np.sqrt(nearest_distance_sq)), 3),
+        'side': side,
+        'nearest_edge_index': int(nearest_index),
+        'nearest_boundary_xy': [round(float(v), 3) for v in nearest_xy],
+    }
+
+
 def tracking_window(polygon, width, height, margin_fraction):
     """Fixed crop: its origin must never move between tracker updates."""
     pad = np.array([width, height]) * margin_fraction
@@ -184,17 +228,49 @@ class Rectifier:
                          borderMode=cv2.BORDER_CONSTANT)
 
 
-def associate_faces(people, faces, cfg, history=None, frame_index=0, max_history_age=15):
+def associate_faces(people, faces, cfg, history=None, frame_index=0, max_history_age=15,
+                    *, diagnostics=None):
     """One-to-one, gated Hungarian matching. Ambiguous face columns are rejected.
 
     history maps a track ID to (frame_index, face center relative to person box).
     This is geometric association, not an identity guarantee.
+
+    Optional ``diagnostics`` must be a dict. It is populated with JSON-safe
+    face/person reasons, but can NEVER override matching or attach an unmatched
+    face to a person. The default path preserves the original matching results.
     """
+    if diagnostics is not None and not isinstance(diagnostics, dict):
+        raise TypeError('diagnostics must be a dict or None.')
     if not people or not faces:
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update({
+                'schema_version': 1,
+                'notes': 'Observations only. Unmatched detections are NOT identities.',
+                'faces': [
+                    {'face_index': int(j), 'person_index': None, 'track_id': None,
+                     'reason': 'no_people_available', 'geometric_candidates': 0,
+                     'accepted_candidates': 0, 'gate_counts': {}}
+                    for j in range(len(faces))
+                ],
+                'people': [
+                    {'person_index': int(i), 'track_id': int(person.track_id),
+                     'face_index': None, 'reason': 'no_faces_detected',
+                     'geometric_candidates': 0, 'accepted_candidates': 0,
+                     'gate_counts': {}}
+                    for i, person in enumerate(people)
+                ],
+                'summary': {'matched': 0, 'unmatched_faces': len(faces),
+                            'unmatched_people': len(people), 'ambiguous_faces': 0},
+            })
         return []
     history = history or {}
     invalid = 1e6
     cost = np.full((len(people), len(faces)), invalid, dtype=float)
+    # Capture gate counts ONLY when diagnostics are explicitly requested.
+    from collections import Counter
+    face_gates = [Counter() for _ in faces] if diagnostics is not None else None
+    person_gates = [Counter() for _ in people] if diagnostics is not None else None
     for i, person in enumerate(people):
         wh = np.maximum(person.box[2:] - person.box[:2], 1)
         pad = wh * cfg['person_padding']
@@ -202,11 +278,20 @@ def associate_faces(people, faces, cfg, history=None, frame_index=0, max_history
         for j, face in enumerate(faces):
             center = (face.box[:2] + face.box[2:]) / 2
             if not np.all(center >= outer[:2]) or not np.all(center <= outer[2:]):
+                if face_gates is not None:
+                    face_gates[j]['center_outside_padded_person_box'] += 1
+                    person_gates[i]['center_outside_padded_person_box'] += 1
                 continue
             cov = coverage(face.box, outer)
             if cov < cfg['min_face_coverage']:
+                if face_gates is not None:
+                    face_gates[j]['insufficient_face_coverage'] += 1
+                    person_gates[i]['insufficient_face_coverage'] += 1
                 continue
             if np.max((face.box[2:] - face.box[:2]) / wh) > cfg['max_face_person_ratio']:
+                if face_gates is not None:
+                    face_gates[j]['face_person_ratio_exceeded'] += 1
+                    person_gates[i]['face_person_ratio_exceeded'] += 1
                 continue
             relative = (center - person.box[:2]) / wh
             # Soft prior only; no assumption that the head must be in the top third.
@@ -216,12 +301,81 @@ def associate_faces(people, faces, cfg, history=None, frame_index=0, max_history
             if previous is not None and frame_index - previous[0] <= max_history_age:
                 value += 0.20 * min(float(np.linalg.norm(relative - previous[1])), 1)
             cost[i, j] = value
+    if diagnostics is not None:
+        geometric = cost.copy()  # Preserve pre-ambiguity costs for explanation only.
+    ambiguous = set()
     for j in range(len(faces)):
         choices = np.sort(cost[:, j][cost[:, j] < invalid])
         if len(choices) > 1 and choices[1] - choices[0] < cfg['ambiguity_margin']:
             cost[:, j] = invalid
+            if diagnostics is not None:
+                ambiguous.add(j)
     rows, cols = linear_sum_assignment(cost)
-    return [(int(i), int(j)) for i, j in zip(rows, cols) if cost[i, j] < cfg['max_cost']]
+    pairs = [(int(i), int(j)) for i, j in zip(rows, cols) if cost[i, j] < cfg['max_cost']]
+    if diagnostics is None:
+        return pairs
+
+    matched_by_face = {j: i for i, j in pairs}
+    matched_by_person = {i: j for i, j in pairs}
+    face_info = []
+    person_info = []
+    for j in range(len(faces)):
+        geometric_count = int(np.count_nonzero(geometric[:, j] < invalid))
+        accepted_count = int(np.count_nonzero(cost[:, j] < cfg['max_cost']))
+        if j in matched_by_face:
+            reason = 'matched'
+        elif j in ambiguous:
+            reason = 'ambiguous_competing_tracks'
+        elif geometric_count == 0:
+            reason = 'no_geometric_candidate'
+        elif accepted_count == 0:
+            reason = 'association_cost_over_threshold'
+        else:
+            reason = 'lost_one_to_one_assignment'
+        i = matched_by_face.get(j)
+        face_info.append({
+            'face_index': int(j),
+            'person_index': int(i) if i is not None else None,
+            'track_id': int(people[i].track_id) if i is not None else None,
+            'reason': reason,
+            'geometric_candidates': geometric_count,
+            'accepted_candidates': accepted_count,
+            'gate_counts': dict(face_gates[j]),
+        })
+    for i, person in enumerate(people):
+        geometric_count = int(np.count_nonzero(geometric[i, :] < invalid))
+        accepted_count = int(np.count_nonzero(cost[i, :] < cfg['max_cost']))
+        if i in matched_by_person:
+            reason = 'matched'
+        elif geometric_count == 0:
+            reason = 'no_geometric_candidate'
+        elif accepted_count == 0 and any(geometric[i, j] < invalid for j in ambiguous):
+            reason = 'ambiguous_competing_tracks'
+        elif accepted_count == 0:
+            reason = 'association_cost_over_threshold'
+        else:
+            reason = 'lost_one_to_one_assignment'
+        j = matched_by_person.get(i)
+        person_info.append({
+            'person_index': int(i), 'track_id': int(person.track_id),
+            'face_index': int(j) if j is not None else None,
+            'reason': reason,
+            'geometric_candidates': geometric_count,
+            'accepted_candidates': accepted_count,
+            'gate_counts': dict(person_gates[i]),
+        })
+    diagnostics.clear()
+    diagnostics.update({
+        'schema_version': 1,
+        'notes': 'Gate counts are per face/person PAIR; no inferred identity for an unmatched face.',
+        'faces': face_info,
+        'people': person_info,
+        'summary': {'matched': len(pairs),
+                    'unmatched_faces': len(faces) - len(pairs),
+                    'unmatched_people': len(people) - len(pairs),
+                    'ambiguous_faces': len(ambiguous)},
+    })
+    return pairs
 
 
 def align_face(frame, landmarks, size=112):
@@ -283,6 +437,41 @@ def quality_metrics(frame, face, cfg, valid_mask=None):
     return {'score': float(score), 'det_score': float(face.confidence),
             'width_px': int(fw), 'height_px': int(fh), 'eye_distance_px': eye_distance,
             'sharpness_112': sharpness, 'brightness': brightness, 'symmetry_hint': symmetry}, 'ok'
+
+
+def face_geometry_diagnostics(face, frame_shape, quality_cfg):
+    """Non-decision geometry for investigating rejected face evidence.
+
+    Reports gaps to configured native-pixel face/eye thresholds, not ArcFace's
+    112x112 aligned-image size. Negative deficits are clamped to zero. Does NOT
+    imply that a face passing these dimensions meets blur/landmark requirements.
+    """
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    x1, y1, x2, y2 = clip_box(face.box, width, height)
+    fw, fh = int(x2 - x1), int(y2 - y1)
+    native_size = min(fw, fh)
+    high_size = float(quality_cfg['min_face_px'])
+    high_eye = float(quality_cfg['min_eye_distance_px'])
+    medium_cfg = quality_cfg.get('medium', {})
+    medium_size = min(high_size, float(medium_cfg.get('min_face_px', 28)))
+    medium_eye = min(high_eye, float(medium_cfg.get('min_eye_distance_px', 6)))
+    landmarks = np.asarray(face.landmarks)
+    eye_distance = None
+    if landmarks.shape == (5, 2) and np.isfinite(landmarks).all():
+        eye_distance = float(np.linalg.norm(landmarks[0] - landmarks[1]))
+    return {
+        'width_px': fw, 'height_px': fh, 'native_short_side_px': native_size,
+        'det_score': float(face.confidence),
+        'eye_distance_px': eye_distance,
+        'high_size_shortfall_px': round(max(0., high_size - native_size), 3),
+        'medium_size_shortfall_px': round(max(0., medium_size - native_size), 3),
+        'high_eye_shortfall_px': (round(max(0., high_eye - eye_distance), 3)
+                                  if eye_distance is not None else None),
+        'medium_eye_shortfall_px': (round(max(0., medium_eye - eye_distance), 3)
+                                    if eye_distance is not None else None),
+        'within_high_size_gate': bool(fw >= high_size and fh >= high_size),
+        'within_medium_size_gate': bool(fw >= medium_size and fh >= medium_size),
+    }
 
 
 def draw_regions(frame, polygon, window):

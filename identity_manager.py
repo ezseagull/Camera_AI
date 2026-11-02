@@ -13,6 +13,7 @@ before returning a confirmed Person ID. Similarities are NOT probabilities.
 """
 from __future__ import annotations
 
+from collections import Counter, deque
 from dataclasses import dataclass, field
 import hashlib
 import math
@@ -127,7 +128,20 @@ class IdentityManager:
         if self.score_mode not in ('centroid', 'template_topk', 'max_template'):
             raise ValueError('Unknown FaceDatabase score_mode.')
         self.template_top_k = self._positive_int('template_top_k', 3)
+        # Experimental bank selection. 'quality' is EXACTLY the legacy default;
+        # temporal_diverse must be enabled explicitly for a controlled A/B test.
+        self.evidence_selection = self.cfg.get('evidence_selection', 'quality')
+        if self.evidence_selection not in ('quality', 'temporal_diverse'):
+            raise ValueError('evidence_selection must be quality or temporal_diverse.')
+        self.diversity_min_quality_ratio = self._float(
+            'diversity_min_quality_ratio', 0.8, 0.0, 1.0)
+        self.diversity_min_utility_gain = self._float(
+            'diversity_min_utility_gain', 0.01, 0.0, 1.0)
+        self.diagnostic_max_events = self._positive_int('diagnostic_max_events', 64)
         self._tracks: dict[int, _TrackState] = {}
+        # Counters and bounded JSON-safe event histories; NEVER store raw frames
+        # or extra embeddings here. Released when a temporary track finalizes.
+        self._evidence_logs: dict[int, dict] = {}
         self._verified_recognizer_key = None
 
     def _positive_int(self, key, default):
@@ -174,6 +188,82 @@ class IdentityManager:
             raise ValueError('timestamp must be a nonnegative finite number.')
         return int(frame_index), timestamp
 
+    def _record_evidence_action(self, track_id, frame_index, timestamp, tier,
+                                action, reason, quality=None, *,
+                                removed_frames=(), top_person_id=None,
+                                top_score=None, top_margin=None):
+        """Bounded audit record; no raw image, crop, embedding or probability."""
+        log = self._evidence_logs.get(track_id)
+        if log is None:
+            log = {'counts': Counter(), 'events': deque(maxlen=self.diagnostic_max_events),
+                   'last_action': None, 'last_reason': None}
+            self._evidence_logs[track_id] = log
+        log['counts'][reason] += 1
+        log['counts']['action_' + action] += 1
+        state = self._tracks.get(track_id)
+        event = {'frame_index': int(frame_index), 'timestamp_s': float(timestamp),
+                 'tier': tier, 'action': action, 'reason': reason,
+                 'quality_score': float(quality) if quality is not None else None,
+                 'removed_frames': [int(x) for x in removed_frames],
+                 'offered_top_person_id': top_person_id,
+                 'offered_top_score': top_score, 'offered_top_margin': top_margin,
+                 'identity_status': state.status if state is not None else 'pending',
+                 'identity_reason': state.reason if state is not None else 'no_face_evidence',
+                 'candidate_person_id': state.candidate_person_id if state is not None else None,
+                 'fused_match_score': state.match_score if state is not None else None,
+                 'fused_second_match_score': state.second_match_score if state is not None else None,
+                 'fused_margin': state.score_margin if state is not None else None,
+                 'vote_fraction': state.vote_fraction if state is not None else None,
+                 'strong_support': state.strong_support if state is not None else 0,
+                 'high_count': len(state.high) if state is not None else 0,
+                 'medium_count': len(state.medium) if state is not None else 0}
+        log['events'].append(event)
+        log['last_action'], log['last_reason'] = action, reason
+
+    @staticmethod
+    def _bank_utility(samples):
+        """A/B-only heuristic balancing quality, time spread and embedding novelty.
+
+        This is NOT a recognition-confidence metric and is never used with
+        evidence_selection='quality'. Embeddings stay in temporary RAM banks.
+        """
+        if not samples:
+            return 0.0
+        quality = float(np.mean([s.quality_score for s in samples]))
+        if len(samples) == 1:
+            return 0.70 * quality
+        temporal, visual = [], []
+        for i, sample in enumerate(samples):
+            others = [item for j, item in enumerate(samples) if i != j]
+            nearest_dt = min(abs(sample.timestamp_s - other.timestamp_s) for other in others)
+            temporal.append(min(nearest_dt / 3.0, 1.0))
+            nearest_distance = min(max(0.0, 1.0 - float(np.dot(sample.embedding, other.embedding)))
+                                   for other in others)
+            visual.append(min(nearest_distance / 0.3, 1.0))
+        return 0.70 * quality + 0.15 * float(np.mean(temporal)) + 0.15 * float(np.mean(visual))
+
+    def get_evidence_diagnostics(self, track_id):
+        """JSON-safe bounded audit for one track; includes only retained sample metadata."""
+        tid = self._track_id(track_id)
+        log = self._evidence_logs.get(tid)
+        state = self._tracks.get(tid)
+        samples = [] if state is None else state.high + state.medium
+        return {'selection_mode': self.evidence_selection,
+                'counts': dict(log['counts']) if log else {},
+                'last_action': log['last_action'] if log else None,
+                'last_reason': log['last_reason'] if log else None,
+                'recent_events': list(log['events']) if log else [],
+                'events_truncated': bool(log and
+                                         sum(v for k, v in log['counts'].items()
+                                             if k.startswith('action_')) > len(log['events'])),
+                'retained_samples': [
+                    {'frame_index': e.frame_index, 'timestamp_s': e.timestamp_s,
+                     'tier': e.tier, 'quality_score': e.quality_score,
+                     'top_person_id': e.top_person_id,
+                     'top_score': e.top_score, 'top_margin': e.top_margin,
+                     'strong_vote': self._strong_vote(e)}
+                    for e in sorted(samples, key=lambda item: item.timestamp_s)]}
+
     def verify_recognizer(self, recognizer):
         """Reject model/preprocessing mismatches with enrolled templates.
 
@@ -215,13 +305,17 @@ class IdentityManager:
         pass a possibly reassigned face to the existing track without review.
         """
         track_id = self._track_id(person.track_id)
-        if not association_ok:
-            return self.get_result(track_id)
-        if metrics is None:
+        if not association_ok or metrics is None:
+            reason = 'association_rejected' if not association_ok else 'quality_unavailable'
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', reason)
             return self.get_result(track_id)
         self.verify_recognizer(recognizer)
         embedding = recognizer.get_embedding(frame, face)
         if embedding is None:
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', 'embedding_unavailable',
+                                         quality=metrics.get('score'))
             return self.get_result(track_id)
         return self.update_embedding(track_id, embedding, metrics, frame_index,
                                      timestamp, tier=tier, association_ok=True)
@@ -237,6 +331,9 @@ class IdentityManager:
         track_id = self._track_id(track_id)
         frame_index, timestamp = self._position(frame_index, timestamp)
         if not association_ok or metrics is None:
+            reason = 'association_rejected' if not association_ok else 'quality_unavailable'
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', reason)
             return self.get_result(track_id)
         if not isinstance(metrics, dict):
             raise TypeError('metrics must be the dict from recognition_quality_metrics().')
@@ -251,6 +348,8 @@ class IdentityManager:
             raise ValueError('Quality score must be finite and in (0,1].')
         if ((tier == 'high' and self.high_k == 0)
                 or (tier == 'medium' and self.medium_k == 0)):
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', 'tier_bank_disabled', quality)
             return self.get_result(track_id)
         try:
             embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
@@ -267,34 +366,78 @@ class IdentityManager:
 
         state = self._tracks.setdefault(track_id, _TrackState(track_id=track_id))
         if state.conflict_reason is not None:
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', 'conflict_latched', quality)
             return self.get_result(track_id)  # Conflict is latched until explicit reset.
         if state.last_frame_index is not None:
             if frame_index < state.last_frame_index or timestamp < state.last_timestamp_s:
                 raise ValueError('Track evidence must arrive in chronological order.')
             if frame_index == state.last_frame_index:
+                self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                             'rejected', 'duplicate_frame', quality)
                 return self.get_result(track_id)  # Prevent repeat use of the same video frame.
         state.last_frame_index = frame_index
         state.last_timestamp_s = timestamp
         if len(self.database) == 0:
             state.status, state.reason = 'unknown', 'empty_database'
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', 'empty_database', quality)
             return self.get_result(track_id)
 
         bank = state.high if tier == 'high' else state.medium
         other_bank = state.medium if tier == 'high' else state.high
         if tier == 'medium' and any(abs(s.timestamp_s - timestamp) < self.min_sample_gap_s
                                     for s in state.high):
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', 'medium_shadowed_by_high', quality)
             return self.get_result(track_id)  # High observation takes priority.
         near = [s for s in bank if abs(s.timestamp_s - timestamp) < self.min_sample_gap_s]
         if near and max(s.quality_score for s in near) >= quality:
+            self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                         'rejected', 'near_higher_quality', quality)
             return self.get_result(track_id)
         near_ids = {id(s) for s in near}
         keep = [s for s in bank if id(s) not in near_ids]
+        removed = list(near)
         limit = self.high_k if tier == 'high' else self.medium_k
+        selection_reason = 'replaced_near' if near else 'accepted_new'
         if len(keep) >= limit:
-            worst = min(keep, key=lambda s: s.quality_score)
-            if worst.quality_score >= quality:
-                return self.get_result(track_id)
-            keep = [s for s in keep if s is not worst]
+            # Default path is deliberately unchanged: quality-only evicts the
+            # lowest quality sample when and only when the offer is better.
+            if self.evidence_selection == 'quality' or limit == 1:
+                worst = min(keep, key=lambda s: s.quality_score)
+                if worst.quality_score >= quality:
+                    self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                                 'rejected', 'bank_full_lower_quality', quality)
+                    return self.get_result(track_id)
+                keep = [s for s in keep if s is not worst]
+                removed.append(worst)
+                selection_reason = 'replaced_worst_quality'
+            else:
+                # Experimental: prospective sample has no identity scores yet.
+                # Only accepted samples are searched against the database.
+                probe = _Evidence(frame_index, timestamp, tier, quality, embedding,
+                                  {}, None, None, None)
+                worst_quality = min(s.quality_score for s in keep)
+                if quality < worst_quality * self.diversity_min_quality_ratio:
+                    self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                                 'rejected', 'diversity_quality_floor', quality)
+                    return self.get_result(track_id)
+                baseline = self._bank_utility(keep)
+                best_gain, evict_index = self.diversity_min_utility_gain, None
+                for index in range(len(keep)):
+                    trial = keep[:index] + keep[index + 1:] + [probe]
+                    gain = self._bank_utility(trial) - baseline
+                    if gain > best_gain:
+                        best_gain, evict_index = gain, index
+                if evict_index is None:
+                    self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                                 'rejected', 'diversity_no_utility_gain', quality)
+                    return self.get_result(track_id)
+                removed.append(keep[evict_index])
+                keep = [s for i, s in enumerate(keep) if i != evict_index]
+                selection_reason = 'replaced_temporal_diverse'
+
         candidates = self.database.search(embedding, top_k=len(self.database),
                                           score_mode=self.score_mode,
                                           template_top_k=self.template_top_k)
@@ -307,9 +450,18 @@ class IdentityManager:
                              float(top['score'] - second['score']) if second else None)
         bank[:] = keep + [evidence]
         if tier == 'high':
+            evicted_medium = [s for s in other_bank
+                              if abs(s.timestamp_s - timestamp) < self.min_sample_gap_s]
+            removed.extend(evicted_medium)
             other_bank[:] = [s for s in other_bank
                              if abs(s.timestamp_s - timestamp) >= self.min_sample_gap_s]
         self._recompute(state)
+        self._record_evidence_action(track_id, frame_index, timestamp, tier,
+                                     'replaced' if removed else 'accepted', selection_reason,
+                                     quality, removed_frames=[s.frame_index for s in removed],
+                                     top_person_id=evidence.top_person_id,
+                                     top_score=evidence.top_score,
+                                     top_margin=evidence.top_margin)
         return self.get_result(track_id)
 
     def _weight(self, evidence):
@@ -419,7 +571,10 @@ class IdentityManager:
                     'vote_fraction': None, 'strong_support': 0, 'evidence_count': 0,
                     'high_count': 0, 'medium_count': 0, 'last_frame_index': None,
                     'last_timestamp_s': None, 'thresholds_configured': self.thresholds_configured,
-                    'score_mode': self.score_mode}
+                    'score_mode': self.score_mode,
+                    'evidence_last_action': self._evidence_logs.get(track_id, {}).get('last_action'),
+                    'evidence_last_reason': self._evidence_logs.get(track_id, {}).get('last_reason'),
+                    'evidence_action_counts': dict(self._evidence_logs.get(track_id, {}).get('counts', {}))}
         return {'track_id': state.track_id, 'person_id': state.person_id if state.status == 'confirmed' else None,
                 'identity_status': state.status, 'reason': state.reason,
                 'candidate_person_id': state.candidate_person_id,
@@ -431,7 +586,10 @@ class IdentityManager:
                 'last_frame_index': state.last_frame_index,
                 'last_timestamp_s': state.last_timestamp_s,
                 'thresholds_configured': self.thresholds_configured,
-                'score_mode': self.score_mode}
+                'score_mode': self.score_mode,
+                'evidence_last_action': self._evidence_logs.get(track_id, {}).get('last_action'),
+                'evidence_last_reason': self._evidence_logs.get(track_id, {}).get('last_reason'),
+                'evidence_action_counts': dict(self._evidence_logs.get(track_id, {}).get('counts', {}))}
 
     def mark_conflict(self, track_id, reason='suspected_tracker_id_switch'):
         """Immediately revoke a track identity when evidence association is unsafe.
@@ -471,15 +629,22 @@ class IdentityManager:
 
     def reset_track(self, track_id):
         """Discard old evidence when a tracker ID is explicitly reused/reset."""
-        self._tracks.pop(self._track_id(track_id), None)
+        tid = self._track_id(track_id)
+        self._tracks.pop(tid, None)
+        self._evidence_logs.pop(tid, None)
 
     def finalize_track(self, track_id):
         """Return last JSON-safe summary and release all in-memory embeddings."""
         track_id = self._track_id(track_id)
         summary = self.get_result(track_id)
+        # Keep output schema consistent with Gallery's most recent track
+        # summary. Detailed bounded events are available through
+        # get_evidence_diagnostics() before finalize_track() if the caller
+        # explicitly exports them (never copied into every video frame).
         self.reset_track(track_id)
         return summary
 
     def close(self):
         """Discard ALL temporary tracking evidence at end of one video run."""
         self._tracks.clear()
+        self._evidence_logs.clear()

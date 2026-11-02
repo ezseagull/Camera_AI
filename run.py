@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from collections import Counter, deque
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -18,7 +19,8 @@ import yaml
 from backends import FaceDetector, FaceRecognizer, PersonTracker
 from gallery import Gallery, write_image, write_json
 from vision import (Rectifier, associate_faces, box_iou, draw_regions, inside_polygon,
-                    polygon_pixels, quality_metrics, recognition_quality_metrics, tracking_window)
+                    polygon_pixels, quality_metrics, recognition_quality_metrics, tracking_window,
+                     face_geometry_diagnostics)
 
 
 def read_config(path):
@@ -95,6 +97,61 @@ def load_tracking_window(cfg, base_dir, polygon, width, height):
     return window
 
 
+def roi_exclusion_geometry(center, polygon):
+    """Describe which polygon boundary rejected a face, without changing ROI.
+
+    The nearest segment is valid for triangles, trapezoids and concave ROI.
+    The side is the direction from the nearest boundary point to the face
+    center, NOT a new inside/outside criterion.
+    """
+    center = np.asarray(center, dtype=np.float64)
+    vertices = np.asarray(polygon, dtype=np.float64)
+    best_distance = float('inf')
+    best_point, best_edge = None, None
+    for edge_index, start in enumerate(vertices):
+        stop = vertices[(edge_index + 1) % len(vertices)]
+        segment = stop - start
+        length_sq = float(segment @ segment)
+        ratio = np.clip(float((center - start) @ segment) / length_sq, 0., 1.) if length_sq else 0.
+        nearest = start + ratio * segment
+        distance = float(np.linalg.norm(center - nearest))
+        if distance < best_distance:
+            best_distance, best_point, best_edge = distance, nearest, edge_index
+    offset = center - best_point
+    if abs(offset[0]) >= abs(offset[1]):
+        side = 'left' if offset[0] < 0 else 'right'
+    else:
+        side = 'top' if offset[1] < 0 else 'bottom'
+    return {'side': side, 'distance_px': round(best_distance, 2),
+            'nearest_edge_index': best_edge,
+            'nearest_boundary_xy': [round(float(v), 1) for v in best_point]}
+
+
+def face_size_bucket(face):
+    """Native detected face size, not resized/aligned ArcFace input size."""
+    size = float(np.min(np.asarray(face.box[2:]) - np.asarray(face.box[:2])))
+    if size < 16:
+        return 'lt16'
+    if size < 20:
+        return '16_19'
+    if size < 24:
+        return '20_23'
+    if size < 28:
+        return '24_27'
+    if size < 32:
+        return '28_31'
+    return 'ge32'
+
+
+def roi_save_payload(path, points, frame_size, rectification_signature):
+    """Keep fixed cyan tracking bounds and existing metadata when editing green ROI."""
+    path = Path(path)
+    existing = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    existing.update({'points': points, 'frame_size': frame_size,
+                     'rectification_signature': rectification_signature})
+    return existing
+
+
 def edit_roi(frame, cfg, base_dir, rectifier):
     h, w = frame.shape[:2]
     scale = min(1., 1280 / w, 780 / h)
@@ -156,8 +213,8 @@ def edit_roi(frame, cfg, base_dir, rectifier):
                     continue
                 path = (base_dir / cfg['roi']['file']).resolve()
                 path.parent.mkdir(parents=True, exist_ok=True)
-                write_json(path, {'points': normalized.tolist(), 'frame_size': [w, h],
-                                  'rectification_signature': rectifier.signature})
+                write_json(path, roi_save_payload(
+                    path, normalized.tolist(), [w, h], rectifier.signature))
                 print('Saved ROI:', path)
                 return
     finally:
@@ -175,15 +232,200 @@ def package_versions():
     return data
 
 
+
+class AdaptiveFaceCapture:
+    """Experimental H1 scheduler; tracking, face gates and identity are untouched.
+
+    Baseline frames still scan everyone in ``boost_only`` mode. Extra detector
+    passes on intermediate frames are capped and require a recently detected,
+    sufficiently large face *inside the existing capture ROI*. The scheduler
+    does not infer pose or person identity from bounding-box position.
+
+    ``balanced`` is a separate, conservative throughput experiment: on baseline
+    frames, downsample only tracks with three consecutive <16px observations
+    outside ROI. Re-probe them periodically and immediately if their person
+    bounding-box area grows; never permanently blacklist a track.
+    """
+
+    DEFAULTS = {
+        'enabled': False,
+        'mode': 'boost_only',
+        'min_candidate_face_px': 24.0,
+        'boost_hold_s': 1.0,
+        'max_extra_people_per_frame': 2,
+        'tiny_face_px': 16.0,
+        'tiny_observations': 3,
+        'far_probe_every_base_frames': 3,
+        'reapproach_area_ratio': 1.3,
+    }
+
+    def __init__(self, face_cfg, fps, *, cli_enabled=False, cli_balanced=False):
+        user = face_cfg.get('adaptive_capture', {})
+        if not isinstance(user, dict):
+            raise ValueError('face.adaptive_capture must be a mapping.')
+        unknown = set(user) - set(self.DEFAULTS)
+        if unknown:
+            raise ValueError(f'Unknown face.adaptive_capture options: {sorted(unknown)}')
+        opts = {**self.DEFAULTS, **user}
+        if type(opts['enabled']) is not bool:
+            raise ValueError('face.adaptive_capture.enabled must be boolean.')
+        if cli_enabled or cli_balanced:
+            opts['enabled'] = True
+        if cli_balanced:
+            opts['mode'] = 'balanced'
+        if opts['mode'] not in ('boost_only', 'balanced'):
+            raise ValueError('face.adaptive_capture.mode must be boost_only or balanced.')
+        for key in ('max_extra_people_per_frame', 'tiny_observations',
+                    'far_probe_every_base_frames'):
+            if type(opts[key]) is not int or opts[key] < 1:
+                raise ValueError(f'face.adaptive_capture.{key} must be a positive integer.')
+        for key in ('min_candidate_face_px', 'boost_hold_s', 'tiny_face_px',
+                    'reapproach_area_ratio'):
+            try:
+                opts[key] = float(opts[key])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f'Invalid face.adaptive_capture.{key}.') from exc
+            if not math.isfinite(opts[key]) or opts[key] <= 0:
+                raise ValueError(f'face.adaptive_capture.{key} must be positive and finite.')
+        if opts['reapproach_area_ratio'] <= 1:
+            raise ValueError('reapproach_area_ratio must exceed 1.')
+        self.cfg = opts
+        self.enabled = opts['enabled']
+        self.interval = int(face_cfg['every_n_frames'])
+        self.hold_frames = max(1, int(math.ceil(opts['boost_hold_s'] * fps)))
+        self._track = {}
+        self.counters = Counter()
+        self.per_track = {}
+
+    @staticmethod
+    def _area(person):
+        wh = np.maximum(np.asarray(person.box[2:]) - person.box[:2], 0.0)
+        return float(wh[0] * wh[1])
+
+    def _state(self, tid):
+        if tid not in self._track:
+            self._track[tid] = {'last_good_frame': None, 'last_good_size': 0.,
+                                'last_observed_area': None,
+                                'tiny_history': deque(maxlen=self.cfg['tiny_observations'])}
+        return self._track[tid]
+
+    def select(self, people, frame_index, identity_manager=None):
+        """Return (people_to_detect, reason) without modifying tracker state.
+
+        A fresh track is NEVER skipped until it has been observed to be tiny
+        outside ROI repeatedly. The boost selection never suppresses a
+        baseline face-detection opportunity in boost_only mode.
+        """
+        baseline = frame_index % self.interval == 0
+        if not self.enabled:
+            return (people if baseline else []), 'baseline' if baseline else 'idle'
+        if baseline:
+            selected = []
+            for person in people:
+                tid = int(person.track_id)
+                state = self._state(tid)
+                tiny = (len(state['tiny_history']) >= self.cfg['tiny_observations']
+                        and all(state['tiny_history']))
+                area = self._area(person)
+                previously = state['last_observed_area']
+                approaching = (previously is not None and
+                               area >= self.cfg['reapproach_area_ratio'] * previously)
+                scheduled_probe = ((frame_index // self.interval + tid) %
+                                   self.cfg['far_probe_every_base_frames'] == 0)
+                suppress = (self.cfg['mode'] == 'balanced' and tiny and
+                            not approaching and not scheduled_probe)
+                if suppress:
+                    self.counters['far_person_crops_deferred'] += 1
+                    self.per_track.setdefault(tid, Counter())['far_deferred'] += 1
+                else:
+                    selected.append(person)
+                    if tiny and self.cfg['mode'] == 'balanced':
+                        self.counters['far_probe_person_crops'] += 1
+            self.counters['baseline_person_crops_selected'] += len(selected)
+            return selected, 'baseline'
+
+        eligible = []
+        for person in people:
+            tid = int(person.track_id)
+            state = self._track.get(tid)
+            if not state or state['last_good_frame'] is None:
+                continue
+            age = frame_index - state['last_good_frame']
+            if not 0 < age <= self.hold_frames:
+                continue
+            # Extra frames are best used while evidence is still incomplete.
+            # Confirmed tracks continue to get the *ordinary* baseline scans.
+            evidence = 0
+            if identity_manager is not None:
+                result = identity_manager.get_result(tid)
+                if result.get('identity_status') in ('confirmed', 'conflict'):
+                    continue
+                evidence = result.get('evidence_count', 0)
+            eligible.append((int(evidence), -state['last_good_size'], age, tid, person))
+        eligible.sort(key=lambda v: v[:4])
+        selected = [item[-1] for item in eligible[:self.cfg['max_extra_people_per_frame']]]
+        self.counters['boost_eligible_person_crops'] += len(eligible)
+        self.counters['boost_person_crops_selected'] += len(selected)
+        self.counters['boost_person_crops_budget_dropped'] += len(eligible) - len(selected)
+        for person in selected:
+            self.per_track.setdefault(int(person.track_id), Counter())['boost_frames'] += 1
+        return selected, 'boost' if selected else 'idle'
+
+    def record_face(self, person, face, inside_roi, frame_index):
+        tid = int(person.track_id)
+        state = self._state(tid)
+        size = float(np.min(np.asarray(face.box[2:]) - np.asarray(face.box[:2])))
+        size = max(0., size)
+        area = self._area(person)
+        state['last_observed_area'] = area
+        state['tiny_history'].append(not inside_roi and size < self.cfg['tiny_face_px'])
+        if inside_roi and size >= self.cfg['min_candidate_face_px']:
+            state['last_good_frame'] = frame_index
+            state['last_good_size'] = size
+            self.counters['opportunity_face_observations'] += 1
+
+    def forget(self, track_id):
+        self._track.pop(int(track_id), None)
+
+    def summary(self):
+        return {'enabled': bool(self.enabled), 'config': dict(self.cfg),
+                'counters': dict(self.counters),
+                'tracks': [{'track_id': tid, **dict(counts)} for tid, counts
+                           in sorted(self.per_track.items())]}
+
+
+def apply_h1_detector_options(cfg, args):
+    """Copy config and enable recovery only when explicitly requested.
+
+    Runtime flags affect the persisted run config, never the on-disk YAML.
+    """
+    cfg = deepcopy(cfg)
+    if getattr(args, 'h1_recovery', False):
+        if not hasattr(FaceDetector, '_read_recovery_config'):
+            raise RuntimeError('H1 Recovery requires the updated backends.py FaceDetector.')
+        recovery = cfg['face'].setdefault('recovery', {})
+        if not isinstance(recovery, dict):
+            raise ValueError('face.recovery must be a mapping.')
+        recovery['enabled'] = True
+        recovery.setdefault('retry_upper_crop', True)
+        recovery.setdefault('upper_crop_height_fraction', .65)
+        recovery.setdefault('retry_rotations_on_unscheduled_empty', False)
+    return cfg
+
 def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_dir,
                   tracker=None, face_detector=None, recognizer=None, identity_manager=None):
     """Backends may be injected for deterministic integration tests."""
+    cfg = apply_h1_detector_options(cfg, args)
     h, w = first_frame.shape[:2]
+    h1 = AdaptiveFaceCapture(cfg['face'], fps,
+                             cli_enabled=getattr(args, 'h1_capture', False),
+                             cli_balanced=getattr(args, 'h1_balanced', False))
     polygon = load_roi(cfg, base_dir, rectifier, (w, h))
     crop_window = load_tracking_window(cfg, base_dir, polygon, w, h)
     recognition_cfg = cfg.get('recognition', {})
     recognition_enabled = recognition_cfg.get('enabled', False)
     identity_records = []
+    identity_evidence_records = []  # Final bounded selection audit per temporary track.
     if recognition_enabled:
         # Do not load recognition models or the enrollment database for ROI editing
         # or when running the original tracking/gallery-only pipeline.
@@ -224,10 +466,42 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
             'enrolled_templates': identity_manager.database.total_templates,
             'thresholds_configured': identity_manager.thresholds_configured,
         }
+    meta['h1_capture'] = {'enabled': h1.enabled, 'mode': h1.cfg['mode'],
+                          'recovery_enabled': bool(cfg['face'].get('recovery', {}).get('enabled', False))}
     write_json(output_dir / 'run.json', meta)
     counters, history, trails = Counter(), {}, {}
     # Diagnostic-only counters: no effect on ROI, matching, quality gates or identity decisions.
     track_capture = {}
+    # Diagnostics are observation-only; no changes to ROI gates or IdentityManager.
+    diagnostic_events = ((output_dir / 'face_diagnostic_events.jsonl').open('w', encoding='utf-8')
+                         if recognition_enabled else None)
+    last_identity_state = {}
+
+    def log_event(event, **fields):
+        if diagnostic_events is not None:
+            diagnostic_events.write(json.dumps({'event': event, **fields},
+                                               ensure_ascii=False, allow_nan=False) + '\n')
+
+    def log_identity_transition(track_id, result, frame_no, time_s, source):
+        key = (result.get('identity_status'), result.get('person_id'),
+               result.get('candidate_person_id'), result.get('reason'))
+        if last_identity_state.get(track_id) != key:
+            last_identity_state[track_id] = key
+            track_capture[track_id]['identity_state_changes'] += 1
+            log_event('identity_state', track_id=track_id, frame_index=frame_no,
+                      timestamp_s=round(time_s, 3), source=source,
+                      identity_status=result.get('identity_status'),
+                      person_id=result.get('person_id'),
+                      candidate_person_id=result.get('candidate_person_id'),
+                      reason=result.get('reason'),
+                      match_score=result.get('match_score'),
+                      second_match_score=result.get('second_match_score'),
+                      score_margin=result.get('score_margin'),
+                      vote_fraction=result.get('vote_fraction'),
+                      evidence_count=result.get('evidence_count'),
+                      high_count=result.get('high_count'),
+                      medium_count=result.get('medium_count'))
+
     started = time.perf_counter()
     frame_index, frame = 0, first_frame
     finish_reason = 'end_of_video'
@@ -244,23 +518,127 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                 trail = trails.setdefault(person.track_id, deque(maxlen=45))
                 trail.append(tuple(np.rint((person.box[:2] + person.box[2:]) / 2).astype(int)))
             face_labels = []
-            if frame_index % cfg['face']['every_n_frames'] == 0:
-                faces = face_detector.detect(clean, people, frame_index)
+            detect_people, capture_mode = h1.select(
+                people, frame_index, identity_manager if recognition_enabled else None)
+            baseline_due = frame_index % cfg['face']['every_n_frames'] == 0
+            # If adaptive capture is disabled, this is identical to the old
+            # baseline schedule. In boost mode, SCRFD runs on a capped subset.
+            if (baseline_due and not h1.enabled) or (detect_people and (baseline_due or h1.enabled)):
+                detect_ids = {int(person.track_id) for person in detect_people}
+                counters['h1_person_crops_submitted'] += len(detect_people)
+                if capture_mode == 'boost':
+                    counters['h1_boost_frames'] += 1
+                detect_started = time.perf_counter()
+                # New SCRFD diagnostics are available only on the real FaceDetector;
+                # injected fake backends keep the unchanged detect() contract.
+                detector_audit = ({} if getattr(args, 'diagnose_association', False)
+                                  and isinstance(face_detector, FaceDetector) else None)
+                if detector_audit is None:
+                    faces = face_detector.detect(clean, detect_people, frame_index)
+                else:
+                    faces = face_detector.detect(clean, detect_people, frame_index,
+                                                 diagnostics=detector_audit)
+                    for item in detector_audit['people']:
+                        tid = item['track_id']
+                        capture = track_capture[tid]
+                        capture['detector_crop_attempts'] += 1
+                        capture['detector_normal_faces'] += item['normal_detections']
+                        capture['detector_rotation_faces'] += item['scheduled_rotation_detections']
+                        capture['detector_recovery_upper_attempts'] += item['recovery_upper_attempts']
+                        capture['detector_recovery_upper_faces'] += item['recovery_upper_detections']
+                        capture['detector_recovery_rotation_attempts'] += item['recovery_rotation_attempts']
+                        capture['detector_recovery_rotation_faces'] += item['recovery_rotation_detections']
+                        if item['reason'] in ('crop_too_small', 'detector_no_face'):
+                            capture[item['reason'] if item['reason'] == 'detector_no_face'
+                                    else 'detector_crop_too_small'] += 1
+                        if item['reason'] != 'face_found' or item['recovery_upper_detections'] or item['recovery_rotation_detections']:
+                            log_event('face_detector', frame_index=frame_index,
+                                      timestamp_s=round(timestamp, 3), **item)
+                counters['h1_detector_elapsed_s'] += time.perf_counter() - detect_started
                 counters['detected_faces'] += len(faces)
-                pairs = associate_faces(people, faces, cfg['association'], history, frame_index,
-                                        max_history_age=max(1, round(0.5 * fps)))
+                if h1.enabled and capture_mode == 'boost':
+                    counters['h1_boost_faces_detected'] += len(faces)
+                if h1.enabled:
+                    log_event('h1_capture_schedule', frame_index=frame_index,
+                              timestamp_s=round(timestamp, 3), capture_mode=capture_mode,
+                              selected_track_ids=sorted(detect_ids),
+                              other_people_on_frame=len(people) - len(detect_people))
+                # Optional, observation-only association audit; no changed thresholds
+                # or person-face assignments. Off by default for baseline/FPS parity.
+                association_audit = {} if getattr(args, 'diagnose_association', False) else None
+                if association_audit is None:
+                    pairs = associate_faces(people, faces, cfg['association'], history, frame_index,
+                                            max_history_age=max(1, round(0.5 * fps)))
+                else:
+                    pairs = associate_faces(people, faces, cfg['association'], history, frame_index,
+                                            max_history_age=max(1, round(0.5 * fps)),
+                                            diagnostics=association_audit)
                 counters['unassigned_faces'] += len(faces) - len(pairs)
+                matched_person_indices = {pi for pi, _ in pairs}
+                matched_face_indices = {fi for _, fi in pairs}
+                for pi, person in enumerate(people):
+                    capture = track_capture[person.track_id]
+                    # In H1, a deferred crop is not a SCRFD miss. Still retain
+                    # all people for conservative face-person association.
+                    if (h1.enabled and person.track_id not in detect_ids
+                            and pi not in matched_person_indices):
+                        continue
+                    capture['face_detection_opportunities'] += 1
+                    if pi not in matched_person_indices:
+                        capture['face_detection_frames_no_match'] += 1
+                    if association_audit is not None:
+                        reason = association_audit['people'][pi]['reason']
+                        diagnostic_key = (reason if reason.startswith('association_')
+                                          else 'association_' + reason)
+                        capture[diagnostic_key] += 1
+                # Unassigned faces cannot safely be attributed to any track.
+                for fi, face in enumerate(faces):
+                    if fi not in matched_face_indices:
+                        association_details = (association_audit['faces'][fi]
+                                               if association_audit is not None else {})
+                        log_event('unassigned_face', frame_index=frame_index,
+                                  timestamp_s=round(timestamp, 3),
+                                  face_center_xy=[round(float(v), 1) for v in
+                                                  (face.box[:2] + face.box[2:]) / 2],
+                                  native_face_size_bucket=face_size_bucket(face),
+                                  **({'association_reason': association_details['reason'],
+                                      'geometric_candidates': association_details['geometric_candidates'],
+                                      'accepted_candidates': association_details['accepted_candidates'],
+                                      'geometric_gate_counts': association_details['gate_counts']}
+                                     if association_audit is not None else {}))
                 for pi, fi in pairs:
                     person, face = people[pi], faces[fi]
                     track_capture[person.track_id]['face_matches'] += 1
                     center = (face.box[:2] + face.box[2:]) / 2
+                    face_in_roi = inside_polygon(center, polygon)
+                    if h1.enabled:
+                        h1.record_face(person, face, face_in_roi, frame_index)
+                        if capture_mode == 'boost':
+                            track_capture[person.track_id]['h1_boost_face_matches'] += 1
+                            counters['h1_boost_face_matches'] += 1
                     relative = (center - person.box[:2]) / np.maximum(person.box[2:] - person.box[:2], 1)
                     history[person.track_id] = (frame_index, relative)
-                    if not inside_polygon(center, polygon):
+                    if not face_in_roi:
+                        if h1.enabled and capture_mode == 'boost':
+                            counters['h1_boost_faces_outside_roi'] += 1
                         counters['outside_roi'] += 1
-                        track_capture[person.track_id]['face_outside_green_roi'] += 1
+                        capture = track_capture[person.track_id]
+                        capture['face_outside_green_roi'] += 1
+                        exit_info = roi_exclusion_geometry(center, polygon)
+                        capture['outside_' + exit_info['side']] += 1
+                        capture['outside_distance_sum_px'] += exit_info['distance_px']
+                        capture['outside_distance_max_px'] = max(
+                            capture['outside_distance_max_px'], exit_info['distance_px'])
+                        log_event('outside_green_roi', frame_index=frame_index,
+                                  timestamp_s=round(timestamp, 3), track_id=person.track_id,
+                                  face_center_xy=[round(float(v), 1) for v in center],
+                                  native_face_size_bucket=face_size_bucket(face), **exit_info)
                         continue
                     track_capture[person.track_id]['face_inside_green_roi'] += 1
+                    if h1.enabled and capture_mode == 'boost':
+                        counters['h1_boost_faces_inside_roi'] += 1
+                    track_capture[person.track_id][
+                        'native_face_size_' + face_size_bucket(face)] += 1
                     metrics, reason = quality_metrics(clean, face, cfg['quality'], rectifier.valid_mask)
                     counters['quality_' + reason] += 1
                     saved = False
@@ -274,15 +652,54 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                             clean, face, cfg['quality'], rectifier.valid_mask)
                         counters['recognition_quality_' + tier] += 1
                         track_capture[person.track_id]['quality_' + tier] += 1
+                        if h1.enabled and capture_mode == 'boost':
+                            counters['h1_boost_quality_' + tier] += 1
+                        if association_audit is not None and rec_metrics is None:
+                            geometry = face_geometry_diagnostics(face, clean.shape, cfg['quality'])
+                            log_event('recognition_quality_rejected', frame_index=frame_index,
+                                      timestamp_s=round(timestamp, 3), track_id=person.track_id,
+                                      quality_reason=tier, **geometry)
                         if rec_metrics is not None:
+                            if h1.enabled and capture_mode == 'boost':
+                                counters['h1_boost_recognition_offers'] += 1
+                                track_capture[person.track_id]['h1_boost_recognition_offers'] += 1
                             track_capture[person.track_id]['recognition_offers'] += 1
                             archived = gallery.offer_recognition(
                                 person, face, rec_metrics, clean, frame_index, timestamp, tier=tier)
                             counters['recognition_gallery_updates'] += int(archived)
                             counters['recognition_attempts'] += 1
-                            identity_manager.observe_face(
+                            before = identity_manager.get_result(person.track_id)
+                            after = identity_manager.observe_face(
                                 person, face, rec_metrics, clean, frame_index, timestamp,
                                 recognizer, tier=tier, association_ok=True)
+                            # A zero bank-size delta can mean replacement OR rejection.
+                            # Exact selection reasons require instrumenting identity_manager.py.
+                            log_event('recognition_offer', frame_index=frame_index,
+                                      timestamp_s=round(timestamp, 3), track_id=person.track_id,
+                                      capture_mode=capture_mode,
+                                      tier=tier, quality_score=float(rec_metrics['score']),
+                                      archived_to_gallery=bool(archived),
+                                      evidence_count_before=before.get('evidence_count', 0),
+                                      evidence_count_after=after.get('evidence_count', 0),
+                                      last_evidence_frame_before=before.get('last_frame_index'),
+                                      last_evidence_frame_after=after.get('last_frame_index'),
+                                      candidate_person_id=after.get('candidate_person_id'),
+                                      match_score=after.get('match_score'),
+                                      second_match_score=after.get('second_match_score'),
+                                      score_margin=after.get('score_margin'),
+                                      vote_fraction=after.get('vote_fraction'),
+                                      strong_support=after.get('strong_support'),
+                                      identity_status=after.get('identity_status'),
+                                      reason=after.get('reason'),
+                                      evidence_action=after.get('evidence_last_action'),
+                                      evidence_action_reason=after.get('evidence_last_reason'))
+                            track_capture[person.track_id]['evidence_net_changes'] += int(
+                                after.get('evidence_count', 0) != before.get('evidence_count', 0))
+                            if h1.enabled and capture_mode == 'boost' and (
+                                    after.get('evidence_count', 0) > before.get('evidence_count', 0)):
+                                counters['h1_boost_evidence_added'] += 1
+                            log_identity_transition(person.track_id, after,
+                                                    frame_index, timestamp, 'recognition_offer')
                     face_labels.append((face, person.track_id, reason, saved))
             if recognition_enabled:
                 # Only flag simultaneous ID collisions for visibly distinct,
@@ -297,10 +714,14 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                         if (other_result['identity_status'] == 'confirmed'
                                 and other_result['person_id'] == result['person_id']
                                 and box_iou(person.box, other.box) < 0.1):
-                            identity_manager.mark_conflict(
+                            first_conflict = identity_manager.mark_conflict(
                                 person.track_id, 'same_identity_on_distinct_simultaneous_tracks')
-                            identity_manager.mark_conflict(
+                            second_conflict = identity_manager.mark_conflict(
                                 other.track_id, 'same_identity_on_distinct_simultaneous_tracks')
+                            log_identity_transition(person.track_id, first_conflict,
+                                                    frame_index, timestamp, 'simultaneous_conflict')
+                            log_identity_transition(other.track_id, second_conflict,
+                                                    frame_index, timestamp, 'simultaneous_conflict')
                             counters['identity_simultaneous_conflicts'] += 1
                             break
                 # Gallery.finalize()/expire() write the track metadata; attach a
@@ -343,10 +764,18 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                 cv2.putText(canvas, f'{tid}: {label}', (max(0, x1), max(75, y1 - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
             for tid in gallery.expire(frame_index, tracker.lost_frames):
+                h1.forget(tid)
                 history.pop(tid, None)
                 trails.pop(tid, None)
                 if recognition_enabled:
-                    identity_records.append(identity_manager.finalize_track(tid))
+                    if hasattr(identity_manager, 'get_evidence_diagnostics'):
+                        identity_evidence_records.append({
+                            'track_id': tid,
+                            **identity_manager.get_evidence_diagnostics(tid)})
+                    final_summary = identity_manager.finalize_track(tid)
+                    log_identity_transition(tid, final_summary, frame_index, timestamp, 'expired')
+                    identity_records.append(final_summary)
+                last_identity_state.pop(tid, None)
             counters['frames'] += 1
             elapsed = time.perf_counter() - started
             cv2.putText(canvas, f'Frame {frame_index} | processing {counters["frames"] / max(elapsed, .001):.1f} fps',
@@ -376,11 +805,20 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
         if recognition_enabled:
             # Final results are written even for early stops and interruptions.
             for tid in list(gallery.tracks):
+                if hasattr(identity_manager, 'get_evidence_diagnostics'):
+                    identity_evidence_records.append({
+                        'track_id': tid,
+                        **identity_manager.get_evidence_diagnostics(tid)})
                 summary = identity_manager.finalize_track(tid)
+                log_identity_transition(tid, summary, frame_index, frame_index / fps, 'finalize')
                 gallery.tracks[tid]['identity'] = summary
                 identity_records.append(summary)
             identity_manager.close()
         gallery.close(finish_reason)
+        h1_report = h1.summary()
+        h1_report['runtime_counters'] = {key: value for key, value in counters.items()
+                                         if key.startswith('h1_')}
+        write_json(output_dir / 'h1_capture_diagnostics.json', h1_report)
         if recognition_enabled:
             write_json(output_dir / 'identities.json', {
                 'status': finish_reason,
@@ -388,15 +826,41 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                 'thresholds_configured': meta['recognition']['thresholds_configured'],
                 'tracks': identity_records,
             })
+            write_json(output_dir / 'identity_evidence_diagnostics.json', {
+                'schema_version': 1,
+                'notes': ('Bounded action history and counters per temporary track. '
+                          'No face images or feature vectors. Similarity scores are not probabilities.'),
+                'tracks': identity_evidence_records,
+            })
             # Each face observation is diagnostic only, not a unique person.
             identity_by_track = {x['track_id']: x for x in identity_records}
             write_json(output_dir / 'face_capture_diagnostics.json', {
-                'schema_version': 1,
-                'notes': 'Counts are frame-level and track-level observations, not unique people or independent embeddings.',
+                'schema_version': 2,
+                'notes': ('Counts are observations, not unique people or independent embeddings. '
+                          'The JSONL event trace contains no embeddings; a net-zero evidence count '
+                          'cannot distinguish bank replacement from discarded offers.'),
+                'event_trace_file': 'face_diagnostic_events.jsonl',
                 'tracks': [
                     {
                         'track_id': tid,
+                        **{key: counts[key] for key in (
+                            'person_frames', 'face_detection_opportunities',
+                            'face_detection_frames_no_match', 'face_matches',
+                            'face_inside_green_roi', 'face_outside_green_roi',
+                            'outside_left', 'outside_right', 'outside_top',
+                            'outside_bottom', 'quality_high', 'quality_medium',
+                            'quality_small', 'quality_eyes_small',
+                            'quality_confidence', 'quality_blur',
+                            'recognition_offers', 'evidence_net_changes',
+                            'identity_state_changes',
+                            'native_face_size_lt16', 'native_face_size_16_19',
+                            'native_face_size_20_23', 'native_face_size_24_27',
+                            'native_face_size_28_31', 'native_face_size_ge32')},
                         **dict(counts),
+                        'outside_distance_mean_px': (
+                            round(counts['outside_distance_sum_px'] /
+                                  counts['face_outside_green_roi'], 2)
+                            if counts['face_outside_green_roi'] else None),
                         'evidence_count': identity_by_track.get(tid, {}).get('evidence_count', 0),
                         'identity_status': identity_by_track.get(tid, {}).get('identity_status', 'pending'),
                         'identity_reason': identity_by_track.get(tid, {}).get('reason', 'not_finalized'),
@@ -409,6 +873,8 @@ def process_video(cap, first_frame, cfg, base_dir, args, rectifier, fps, output_
                 item['identity_status'] == 'confirmed' for item in identity_records)
             counters['identity_tracks_conflict'] = sum(
                 item['identity_status'] == 'conflict' for item in identity_records)
+        if diagnostic_events is not None:
+            diagnostic_events.close()
         if writer is not None:
             writer.release()
         if not args.headless:
@@ -434,6 +900,14 @@ def main():
     parser.add_argument('--max-frames', type=int, default=0)
     parser.add_argument('--show-candidates', action='store_true',
                         help='Show unverified candidate IDs in annotated video for diagnostic review only.')
+    parser.add_argument('--diagnose-association', action='store_true',
+                        help='Write detailed association gate and face-size diagnostics; matching is unchanged.')
+    parser.add_argument('--h1-capture', action='store_true',
+                        help='H1 boost-only: capped extra SCRFD scans after a usable face appears inside ROI.')
+    parser.add_argument('--h1-balanced', action='store_true',
+                        help='H1 balanced: boosts plus periodic downsampling of persistently tiny outside-ROI faces.')
+    parser.add_argument('--h1-recovery', action='store_true',
+                        help='Independently enable experimental miss-only upper-crop SCRFD recovery (new backends.py).')
     args = parser.parse_args()
     if args.max_frames < 0 or args.at_second < 0:
         parser.error('--max-frames and --at-second must be nonnegative')

@@ -84,6 +84,40 @@ class FaceDetector:
         print('Face detector ONNX providers:', active)
         if device == 'cuda' and 'CUDAExecutionProvider' not in active:
             raise RuntimeError('ONNX fell back to CPU; check CUDA/cuDNN installation or select CPU explicitly.')
+        # Experimental miss-only recovery is opt-in. No default detection changes.
+        # The normal SCRFD, association, ROI and quality gates remain authoritative.
+        self._recovery = self._read_recovery_config(cfg)
+
+    @staticmethod
+    def _read_recovery_config(cfg):
+        recovery = cfg.get('recovery', {})
+        if not isinstance(recovery, dict):
+            raise ValueError('face.recovery must be a mapping.')
+        allowed = {'enabled', 'retry_upper_crop', 'upper_crop_height_fraction',
+                   'retry_rotations_on_unscheduled_empty'}
+        extras = set(recovery) - allowed
+        if extras:
+            raise ValueError(f'Unknown face.recovery settings: {sorted(extras)}')
+        enabled = recovery.get('enabled', False)
+        upper = recovery.get('retry_upper_crop', True)
+        rotate = recovery.get('retry_rotations_on_unscheduled_empty', False)
+        for name, val in [('enabled', enabled), ('retry_upper_crop', upper),
+                          ('retry_rotations_on_unscheduled_empty', rotate)]:
+            if type(val) is not bool:
+                raise ValueError(f'face.recovery.{name} must be a boolean.')
+        try:
+            height_fraction = float(recovery.get('upper_crop_height_fraction', 0.65))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('face.recovery.upper_crop_height_fraction must be in (0,1).') from exc
+        if not math.isfinite(height_fraction) or not 0 < height_fraction < 1:
+            raise ValueError('face.recovery.upper_crop_height_fraction must be in (0,1).')
+        # Upper crop must truly be shorter than the primary crop to avoid a
+        # pointless duplicate SCRFD call (which could also increase NMS noise).
+        if enabled and upper and height_fraction >= float(cfg['person_crop_height_fraction']):
+            raise ValueError('Recovery upper crop must be shorter than the primary person crop.')
+        return {'enabled': enabled, 'retry_upper_crop': upper,
+                'upper_crop_height_fraction': height_fraction,
+                'retry_rotations_on_unscheduled_empty': rotate}
 
     def _detect_crop(self, crop, offset, angle):
         if angle:
@@ -111,26 +145,98 @@ class FaceDetector:
             found.append(Face(box, points, float(row[4]), float(angle)))
         return found
 
-    def detect(self, frame, people, frame_index):
+    def detect(self, frame, people, frame_index, diagnostics=None):
+        """Detect faces inside person crops, preserving the original gates.
+
+        When ``diagnostics`` is a dict, populate JSON-safe per-track details.
+        An optional, explicitly enabled recovery trial retries a shorter head
+        crop only after the normal detector (and scheduled rotations) found no
+        face. Extra detections STILL pass global NMS, association, ROI and quality.
+        """
         all_faces = []
         h, w = frame.shape[:2]
+        # Lazy fallback also supports test doubles built with __new__.
+        recovery = getattr(self, '_recovery', None)
+        if recovery is None:
+            recovery = self._read_recovery_config(self.cfg)
+        if diagnostics is not None:
+            if not isinstance(diagnostics, dict):
+                raise TypeError('diagnostics must be a dict or None.')
+            diagnostics.clear()
+            diagnostics['people'] = []
         for person in people:
             box = expanded_box(person.box, self.cfg['crop_padding'], w, h,
                                self.cfg['person_crop_height_fraction'])
-            x1, y1, x2, y2 = box
+            x1, y1, x2, y2 = map(int, box)
+            audit = None
+            if diagnostics is not None:
+                audit = {'track_id': int(person.track_id),
+                         'crop_box_xyxy': [x1, y1, x2, y2],
+                         'crop_width_px': x2 - x1, 'crop_height_px': y2 - y1,
+                         'normal_detections': 0, 'scheduled_rotation_attempts': 0,
+                         'scheduled_rotation_detections': 0,
+                         'recovery_upper_attempts': 0, 'recovery_upper_detections': 0,
+                         'recovery_rotation_attempts': 0,
+                         'recovery_rotation_detections': 0,
+                         'faces_before_global_nms': 0}
+                diagnostics['people'].append(audit)
             if x2 - x1 < 12 or y2 - y1 < 12:
+                if audit is not None:
+                    audit['reason'] = 'crop_too_small'
                 continue
             crop = frame[y1:y2, x1:x2]
             offset = np.array([x1, y1])
             found = self._detect_crop(crop, offset, 0)
-            # Budget expensive rotation search; ordinary detection still runs each face interval.
-            if frame_index % self.cfg['rotation_every_n_frames'] == 0 and (
-                    not found or not self.cfg['rotate_only_if_empty']):
+            if audit is not None:
+                audit['normal_detections'] = len(found)
+            # Original scheduled rotation policy (unchanged).
+            scheduled = frame_index % self.cfg['rotation_every_n_frames'] == 0
+            if scheduled and (not found or not self.cfg['rotate_only_if_empty']):
                 for angle in self.cfg['rotation_angles']:
                     if angle:
-                        found.extend(self._detect_crop(crop, offset, float(angle)))
+                        rotated = self._detect_crop(crop, offset, float(angle))
+                        found.extend(rotated)
+                        if audit is not None:
+                            audit['scheduled_rotation_attempts'] += 1
+                            audit['scheduled_rotation_detections'] += len(rotated)
+            # Miss-only recovery is an A/B option, OFF by default. No extra
+            # detector calls when normal/scheduled detection already succeeded.
+            if recovery['enabled'] and not found:
+                if recovery['retry_upper_crop']:
+                    upper_box = expanded_box(
+                        person.box, self.cfg['crop_padding'], w, h,
+                        recovery['upper_crop_height_fraction'])
+                    ux1, uy1, ux2, uy2 = map(int, upper_box)
+                    if (ux2 - ux1 >= 12 and uy2 - uy1 >= 12
+                            and (ux1, uy1, ux2, uy2) != (x1, y1, x2, y2)):
+                        upper_crop = frame[uy1:uy2, ux1:ux2]
+                        recovered = self._detect_crop(
+                            upper_crop, np.array([ux1, uy1]), 0)
+                        found.extend(recovered)
+                        if audit is not None:
+                            audit['recovery_upper_attempts'] += 1
+                            audit['recovery_upper_detections'] += len(recovered)
+                if not found and not scheduled and recovery['retry_rotations_on_unscheduled_empty']:
+                    for angle in self.cfg['rotation_angles']:
+                        if angle:
+                            recovered = self._detect_crop(crop, offset, float(angle))
+                            found.extend(recovered)
+                            if audit is not None:
+                                audit['recovery_rotation_attempts'] += 1
+                                audit['recovery_rotation_detections'] += len(recovered)
+            if audit is not None:
+                audit['faces_before_global_nms'] = len(found)
+                audit['reason'] = ('face_found' if found else 'detector_no_face')
             all_faces.extend(found)
-        return nms_faces(all_faces, self.cfg['nms_iou'])
+        final = nms_faces(all_faces, self.cfg['nms_iou'])
+        if diagnostics is not None:
+            diagnostics['summary'] = {
+                'person_crops': len(people),
+                'detections_before_global_nms': len(all_faces),
+                'detections_after_global_nms': len(final),
+                'recovery_enabled': bool(recovery['enabled']),
+            }
+        return final
 
 
 class FaceRecognizer:
